@@ -95,6 +95,7 @@ type Channel struct {
 	Props               map[string]any     `json:"props"`
 	GroupConstrained    *bool              `json:"group_constrained"`
 	AutoTranslation     bool               `json:"autotranslation"`
+	IsEncrypted         bool               `json:"is_encrypted"`
 	Shared              *bool              `json:"shared"`
 	TotalMsgCountRoot   int64              `json:"total_msg_count_root"`
 	PolicyID            *string            `json:"policy_id"`
@@ -126,6 +127,7 @@ func (o *Channel) Auditable() map[string]any {
 		"update_at":            o.UpdateAt,
 		"policy_enforced":      o.PolicyEnforced,
 		"autotranslation":      o.AutoTranslation,
+		"is_encrypted":         o.IsEncrypted,
 		"policy_is_active":     o.PolicyIsActive, // this field is only for logging purposes
 	}
 }
@@ -465,6 +467,7 @@ func (o *Channel) Sanitize() Channel {
 		TeamId:      o.TeamId,
 		Type:        o.Type,
 		DisplayName: o.DisplayName,
+		IsEncrypted: o.IsEncrypted,
 	}
 }
 

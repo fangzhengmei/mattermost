@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"testing"
 
 	"github.com/mattermost/mattermost/server/public/model"
@@ -54,5 +55,38 @@ func TestDoSetupContentFlaggingProperties(t *testing.T) {
 		data, sysErr := th.Store.System().GetByName(contentFlaggingSetupDoneKey)
 		require.NoError(t, sysErr)
 		require.Equal(t, "v5", data.Value)
+	})
+}
+
+func TestDoCMEEncryptionManagerRoleCreationMigration(t *testing.T) {
+	t.Run("creates the role with empty default permissions", func(t *testing.T) {
+		th := Setup(t)
+
+		role, err := th.Store.Role().GetByName(context.Background(), model.CMEEncryptionManagerRoleId)
+		require.NoError(t, err)
+		require.NotNil(t, role)
+		require.Equal(t, model.CMEEncryptionManagerRoleId, role.Name)
+		require.True(t, role.BuiltIn)
+		require.False(t, role.SchemeManaged)
+		require.Empty(t, role.Permissions, "Phase 2 role ships with zero default permissions; Phase 3 gate is role-based")
+
+		sys, sysErr := th.Store.System().GetByName(CMEEncryptionManagerRoleCreationMigrationKey)
+		require.NoError(t, sysErr)
+		require.Equal(t, "true", sys.Value)
+	})
+
+	t.Run("the migration is idempotent", func(t *testing.T) {
+		th := Setup(t)
+
+		_, err := th.Store.System().PermanentDeleteByName(CMEEncryptionManagerRoleCreationMigrationKey)
+		require.NoError(t, err)
+
+		err = th.Server.doCMEEncryptionManagerRoleCreationMigration()
+		require.NoError(t, err)
+
+		role, err := th.Store.Role().GetByName(context.Background(), model.CMEEncryptionManagerRoleId)
+		require.NoError(t, err)
+		require.NotNil(t, role)
+		require.Equal(t, model.CMEEncryptionManagerRoleId, role.Name)
 	})
 }

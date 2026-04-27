@@ -28,6 +28,7 @@ func init() {
 		SystemReadOnlyAdminRoleId,
 		SystemManagerRoleId,
 		SharedChannelManagerRoleId,
+		CMEEncryptionManagerRoleId,
 	}
 
 	BuiltInSchemeManagedRoleIDs = append([]string{
@@ -382,6 +383,7 @@ const (
 	SystemManagerRoleId          = "system_manager"
 	SystemCustomGroupAdminRoleId = "system_custom_group_admin"
 	SharedChannelManagerRoleId   = "system_shared_channel_manager"
+	CMEEncryptionManagerRoleId   = "cme_encryption_manager"
 
 	TeamGuestRoleId         = "team_guest"
 	TeamUserRoleId          = "team_user"
@@ -1193,6 +1195,18 @@ func MakeDefaultRoles() map[string]*Role {
 		DisplayName:   "authentication.roles.system_shared_channel_manager.name",
 		Description:   "authentication.roles.system_shared_channel_manager.description",
 		Permissions:   SharedChannelManagerDefaultPermissions,
+		SchemeManaged: false,
+		BuiltIn:       true,
+	}
+
+	// CMEEncryptionManager is a label-only system role used to mark users who may create
+	// Customer-Managed Encryption channels. It grants no direct permissions. Once a channel exists,
+	// authority over that channel comes from that channel’s channel_admin assignment, not from this role
+	roles[CMEEncryptionManagerRoleId] = &Role{
+		Name:          CMEEncryptionManagerRoleId,
+		DisplayName:   "authentication.roles.cme_encryption_manager.name",
+		Description:   "authentication.roles.cme_encryption_manager.description",
+		Permissions:   []string{},
 		SchemeManaged: false,
 		BuiltIn:       true,
 	}

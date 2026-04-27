@@ -4,6 +4,7 @@
 package model
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -198,6 +199,7 @@ func TestSanitize(t *testing.T) {
 		TotalMsgCountRoot: 1,
 		PolicyID:          &schemaId,
 		LastRootPostAt:    1,
+		IsEncrypted:       true,
 	}
 	s := o.Sanitize()
 
@@ -220,4 +222,41 @@ func TestSanitize(t *testing.T) {
 	require.Equal(t, int64(0), s.TotalMsgCountRoot)
 	require.Nil(t, s.PolicyID)
 	require.Equal(t, int64(0), s.LastRootPostAt)
+	require.True(t, s.IsEncrypted, "IsEncrypted should be preserved through Sanitize")
+}
+
+func TestChannelIsEncryptedJSONRoundTrip(t *testing.T) {
+	t.Run("true value round-trips", func(t *testing.T) {
+		o := Channel{Id: NewId(), IsEncrypted: true}
+		b, err := json.Marshal(o)
+		require.NoError(t, err)
+		require.Contains(t, string(b), `"is_encrypted":true`)
+
+		var decoded Channel
+		require.NoError(t, json.Unmarshal(b, &decoded))
+		require.True(t, decoded.IsEncrypted)
+	})
+
+	t.Run("false value round-trips", func(t *testing.T) {
+		o := Channel{Id: NewId(), IsEncrypted: false}
+		b, err := json.Marshal(o)
+		require.NoError(t, err)
+		require.Contains(t, string(b), `"is_encrypted":false`)
+
+		var decoded Channel
+		require.NoError(t, json.Unmarshal(b, &decoded))
+		require.False(t, decoded.IsEncrypted)
+	})
+}
+
+func TestChannelAuditableIncludesIsEncrypted(t *testing.T) {
+	o := Channel{Id: NewId(), IsEncrypted: true}
+	audit := o.Auditable()
+	v, ok := audit["is_encrypted"]
+	require.True(t, ok, "Auditable should include is_encrypted key")
+	require.Equal(t, true, v)
+
+	o.IsEncrypted = false
+	audit = o.Auditable()
+	require.Equal(t, false, audit["is_encrypted"])
 }

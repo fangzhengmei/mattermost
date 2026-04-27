@@ -135,6 +135,7 @@ func channelSliceColumns(isSelect bool, prefix ...string) []string {
 		p + "SchemeId",
 		p + "GroupConstrained",
 		p + "AutoTranslation",
+		p + "IsEncrypted",
 		p + "Shared",
 		p + "TotalMsgCountRoot",
 		p + "LastRootPostAt",
@@ -173,6 +174,7 @@ func channelToSlice(channel *model.Channel) []any {
 		channel.SchemeId,
 		channel.GroupConstrained,
 		channel.AutoTranslation,
+		channel.IsEncrypted,
 		channel.Shared,
 		channel.TotalMsgCountRoot,
 		channel.LastRootPostAt,
@@ -791,6 +793,17 @@ func (s SqlChannelStore) updateChannelT(transaction *sqlxTxWrapper, channel *mod
 
 	if err := channel.IsValid(); err != nil {
 		return nil, err
+	}
+
+	// IsEncrypted is immutable after channel creation. The UPDATE SET clause below deliberately
+	// omits IsEncrypted so accidental writes are a silent no-op; the pre-check here makes an
+	// attempted toggle loud and typed.
+	var existingIsEncrypted bool
+	if err := transaction.Get(&existingIsEncrypted, `SELECT IsEncrypted FROM Channels WHERE Id = ? FOR UPDATE`, channel.Id); err != nil {
+		return nil, errors.Wrapf(err, "failed to read existing IsEncrypted for channel id=%s", channel.Id)
+	}
+	if existingIsEncrypted != channel.IsEncrypted {
+		return nil, store.NewErrInvalidInput("Channel", "IsEncrypted", channel.IsEncrypted)
 	}
 
 	res, err := transaction.NamedExec(`UPDATE Channels

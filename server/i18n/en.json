@@ -5767,6 +5767,10 @@
     "translation": "{{.UsersNum}} member of the {{.WorkspaceName}} workspace has requested a workspace upgrade for: "
   },
   {
+    "id": "app.cme.message_unavailable",
+    "translation": "[Encrypted Message Unavailable]"
+  },
+  {
     "id": "app.command.createcommand.internal_error",
     "translation": "Unable to save the command."
   },

@@ -68,6 +68,10 @@ const (
 	ChannelMemberWillBeAddedID                = 49
 	TeamMemberWillBeAddedID                   = 50
 	ChannelWillBeArchivedID                   = 51
+	CMECreateChannelKeyID                     = 52
+	CMERevokeChannelKeyID                     = 53
+	CMEEncryptID                              = 54
+	CMEDecryptID                              = 55
 	TotalHooksID                              = iota
 )
 
@@ -75,6 +79,30 @@ const (
 	// DismissPostError dismisses a pending post when the error is returned from MessageWillBePosted.
 	DismissPostError = "plugin.message_will_be_posted.dismiss_post"
 )
+
+// CMEHookResult is the return value for the CMECreateChannelKey and CMERevokeChannelKey hooks. A
+// nil pointer from the hook indicates transport failure / plugin unavailable (swallowed by the
+// plugin RPC layer); a non-nil pointer with ErrorDetail == "" indicates success; a non-nil pointer
+// with ErrorDetail != "" indicates plugin-reported failure.
+type CMEHookResult struct {
+	ErrorDetail string
+}
+
+// CMEEncryptResult is the return value for the CMEEncrypt hook. On success, Ciphertext is populated
+// and ErrorDetail is empty. On failure, Ciphertext is nil and ErrorDetail describes the reason.
+type CMEEncryptResult struct {
+	Ciphertext  []byte
+	ErrorDetail string
+}
+
+// CMEDecryptBatchResult is the return value for the CMEDecrypt hook. Plaintexts is parallel to the
+// input ciphertext slice; a nil slot signals per-item failure (e.g., tampered ciphertext).
+// ErrorDetail != "" indicates that the whole batch failed (e.g., key not found, HSM unreachable)
+// and Plaintexts will be nil.
+type CMEDecryptBatchResult struct {
+	Plaintexts  [][]byte
+	ErrorDetail string
+}
 
 // Hooks describes the methods a plugin may implement to automatically receive the corresponding
 // event.
@@ -465,4 +493,30 @@ type Hooks interface {
 	//
 	// Minimum server version: 10.7
 	OnSAMLLogin(c *Context, user *model.User, assertion *saml2.AssertionInfo) error
+
+	// CMECreateChannelKey is invoked when a CME-classified channel is created. The plugin generates
+	// a DEK, asks the HSM to wrap it, stores the wrapped DEK, and caches the plaintext DEK. Returns
+	// ErrorDetail="" on success.
+	//
+	// Minimum server version: 11.8
+	CMECreateChannelKey(channelID string) *CMEHookResult
+
+	// CMERevokeChannelKey deletes the wrapped DEK for a channel and evicts the plaintext DEK from
+	// the in-process cache. Called on channel delete.
+	//
+	// Minimum server version: 11.8
+	CMERevokeChannelKey(channelID string) *CMEHookResult
+
+	// CMEEncrypt encrypts opaque bytes for the given CME channel using AES-GCM with the channel's
+	// DEK. Each ciphertext is self-framed: nonce ‖ GCM ct ‖ tag.
+	//
+	// Minimum server version: 11.8
+	CMEEncrypt(channelID string, plaintext []byte) *CMEEncryptResult
+
+	// CMEDecrypt batch-decrypts opaque ciphertexts for a single CME channel. Plaintexts is parallel
+	// to the input slice; a nil slot signals per-item failure. ErrorDetail!="" means the whole
+	// batch failed.
+	//
+	// Minimum server version: 11.8
+	CMEDecrypt(channelID string, ciphertexts [][]byte) *CMEDecryptBatchResult
 }
