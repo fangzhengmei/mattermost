@@ -288,6 +288,23 @@ func TestPatchRole(t *testing.T) {
 		_, resp, err = client.PatchRole(context.Background(), systemManager.Id, patchManageSystem)
 		require.Error(t, err)
 		CheckNotImplementedStatus(t, resp)
+
+		for _, permission := range []string{
+			model.PermissionSysconsoleWriteUserManagementUsers.Id,
+			model.PermissionEditOtherUsers.Id,
+			model.PermissionPromoteGuest.Id,
+			model.PermissionDemoteToGuest.Id,
+		} {
+			t.Run("cannot patch privileged user management permission "+permission, func(t *testing.T) {
+				patchPrivilegedPermission := &model.RolePatch{
+					Permissions: &[]string{permission},
+				}
+
+				_, resp, err = client.PatchRole(context.Background(), role.Id, patchPrivilegedPermission)
+				require.Error(t, err)
+				CheckNotImplementedStatus(t, resp)
+			})
+		}
 	})
 
 	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {

@@ -18,6 +18,11 @@ var notAllowedPermissions = []string{
 	model.PermissionSysconsoleReadUserManagementSystemRoles.Id,
 	model.PermissionManageRoles.Id,
 	model.PermissionManageSystem.Id,
+	// Defense in depth: privileges a system_manager should never grant.
+	model.PermissionSysconsoleWriteUserManagementUsers.Id,
+	model.PermissionEditOtherUsers.Id,
+	model.PermissionPromoteGuest.Id,
+	model.PermissionDemoteToGuest.Id,
 }
 
 func (api *API) InitRole() {
