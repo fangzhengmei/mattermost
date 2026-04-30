@@ -12,6 +12,6 @@ const (
 	PluginIdChannelExport = "com.mattermost.plugin-channel-export"
 	PluginIdAI            = "mattermost-ai"
 
-	PluginIDMBE             = "message-based-encryption"
+	MBEPluginID             = "message-based-encryption"
 	CMEUnavailableMessageID = "app.cme.message_unavailable"
 )
