@@ -10,7 +10,7 @@ import (
 )
 
 func TestMBEPluginID(t *testing.T) {
-	require.Equal(t, "message-based-encryption", MBEPluginID, "MBEPluginID must match the plugin.json id")
+	require.Equal(t, "message-based-encryption", PluginIDMBE, "MBEPluginID must match the plugin.json id")
 }
 
 func TestCMEUnavailableMessageID(t *testing.T) {
