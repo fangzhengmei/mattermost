@@ -323,20 +323,9 @@ func TestMakeDefaultRolesContainsNewManagerRoles(t *testing.T) {
 			"role should NOT have manage_secure_connections permission")
 	})
 
-	t.Run("cme_encryption_manager role exists with zero default permissions", func(t *testing.T) {
-		role, ok := roles[CMEEncryptionManagerRoleId]
-		require.True(t, ok, "cme_encryption_manager role should exist in MakeDefaultRoles")
-		assert.Equal(t, "cme_encryption_manager", role.Name)
-		assert.True(t, role.BuiltIn, "role should be built-in")
-		assert.False(t, role.SchemeManaged, "role should not be scheme-managed")
-		assert.Empty(t, role.Permissions, "cme_encryption_manager has zero default permissions; the gate is role-based not permission-based")
-	})
-
 	t.Run("roles are included in NewSystemRoleIDs", func(t *testing.T) {
 		assert.True(t, slices.Contains(NewSystemRoleIDs, SharedChannelManagerRoleId),
 			"system_shared_channel_manager should be in NewSystemRoleIDs")
-		assert.True(t, slices.Contains(NewSystemRoleIDs, CMEEncryptionManagerRoleId),
-			"cme_encryption_manager should be in NewSystemRoleIDs so legacy role-assignment paths are guarded")
 	})
 
 	t.Run("system_admin includes manage_oauth by default", func(t *testing.T) {

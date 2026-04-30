@@ -24,7 +24,6 @@ const (
 	SystemConsoleRolesCreationMigrationKey         = "SystemConsoleRolesCreationMigrationComplete"
 	CustomGroupAdminRoleCreationMigrationKey       = "CustomGroupAdminRoleCreationMigrationComplete"
 	SharedChannelManagerRoleCreationMigrationKey   = "SystemSharedChannelManagerRoleCreationMigrationComplete"
-	CMEEncryptionManagerRoleCreationMigrationKey   = "CMEEncryptionManagerRoleCreationMigrationComplete"
 	ContentExtractionConfigDefaultTrueMigrationKey = "ContentExtractionConfigDefaultTrueMigrationComplete"
 	PlaybookRolesCreationMigrationKey              = "PlaybookRolesCreationMigrationComplete"
 	FirstAdminSetupCompleteKey                     = model.SystemFirstAdminSetupComplete
@@ -369,10 +368,6 @@ func (s *Server) doCustomGroupAdminRoleCreationMigration() error {
 
 func (s *Server) doSharedChannelManagerRoleCreationMigration() error {
 	return s.doSingleRoleCreationMigration(SharedChannelManagerRoleCreationMigrationKey, model.SharedChannelManagerRoleId)
-}
-
-func (s *Server) doCMEEncryptionManagerRoleCreationMigration() error {
-	return s.doSingleRoleCreationMigration(CMEEncryptionManagerRoleCreationMigrationKey, model.CMEEncryptionManagerRoleId)
 }
 
 func (s *Server) doContentExtractionConfigDefaultTrueMigration() error {
@@ -1005,7 +1000,6 @@ func (s *Server) doAppMigrations() {
 		{"System Console Roles Creation Migration", s.doSystemConsoleRolesCreationMigration},
 		{"Custom Group Admin Role Creation Migration", s.doCustomGroupAdminRoleCreationMigration},
 		{"Shared Channel Manager Role Creation Migration", s.doSharedChannelManagerRoleCreationMigration},
-		{"CME Encryption Manager Role Creation Migration", s.doCMEEncryptionManagerRoleCreationMigration},
 		// This migration always run after dependent migrations such as the guest roles migration.
 		{"Permissions Migrations", s.doPermissionsMigrations},
 		{"Content Extraction Config Default True Migration", s.doContentExtractionConfigDefaultTrueMigration},

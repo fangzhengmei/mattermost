@@ -334,31 +334,3 @@ func (hooks *hooksTimerLayer) OnSAMLLogin(c *Context, user *model.User, assertio
 	hooks.recordTime(startTime, "OnSAMLLogin", _returnsA == nil)
 	return _returnsA
 }
-
-func (hooks *hooksTimerLayer) CMECreateChannelKey(channelID string) *CMEHookResult {
-	startTime := timePkg.Now()
-	_returnsA := hooks.hooksImpl.CMECreateChannelKey(channelID)
-	hooks.recordTime(startTime, "CMECreateChannelKey", true)
-	return _returnsA
-}
-
-func (hooks *hooksTimerLayer) CMERevokeChannelKey(channelID string) *CMEHookResult {
-	startTime := timePkg.Now()
-	_returnsA := hooks.hooksImpl.CMERevokeChannelKey(channelID)
-	hooks.recordTime(startTime, "CMERevokeChannelKey", true)
-	return _returnsA
-}
-
-func (hooks *hooksTimerLayer) CMEEncrypt(channelID string, plaintext []byte) *CMEEncryptResult {
-	startTime := timePkg.Now()
-	_returnsA := hooks.hooksImpl.CMEEncrypt(channelID, plaintext)
-	hooks.recordTime(startTime, "CMEEncrypt", true)
-	return _returnsA
-}
-
-func (hooks *hooksTimerLayer) CMEDecrypt(channelID string, ciphertexts [][]byte) *CMEDecryptBatchResult {
-	startTime := timePkg.Now()
-	_returnsA := hooks.hooksImpl.CMEDecrypt(channelID, ciphertexts)
-	hooks.recordTime(startTime, "CMEDecrypt", true)
-	return _returnsA
-}

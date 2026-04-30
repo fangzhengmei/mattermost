@@ -477,7 +477,6 @@ func extractForConstants(name string, valueNode ast.Expr) *string {
 		"InvalidLicenseError":          true,
 		"NoTranslation":                true,
 		"PayloadParseError":            true,
-		"CMEUnavailableMessageID":      true,
 	}
 
 	if _, ok := validConstants[name]; !ok {
