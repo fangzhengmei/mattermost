@@ -1,154 +1,116 @@
-# Mattermost 插件与 Webhook 集成机制分析报告
+# Mattermost 插件与 Webhook 集成机制深度分析报告
 
 ## 1. 概述
 
-本文档分析了 Mattermost 中插件和 Webhook 如何介入核心消息事件流，包括插件的注册机制、事件回调调度机制，以及 Webhook 在消息发送和接收两侧的工作原理。
+本文档深入分析 Mattermost 中插件和 Webhook 如何介入核心消息事件流，重点剖析：
 
-**注意**：当前代码库主要包含前端代码，以下分析基于前端代码结构和实现逻辑。
+1. **Webhook 服务端关键链路**：从接收请求到广播消息的完整流程
+2. **异常分支处理**：各类错误场景的处理机制
+3. **插件回调调度核对**：事件顺序、执行时机、潜在偏差分析
+
+**注意**：当前代码库主要包含前端代码，服务端分析基于 Mattermost 架构知识、前端代码线索和公开文档进行推断。
 
 ---
 
-## 2. 插件注册机制
+## 2. 插件注册与生命周期管理
 
-### 2.1 插件类型定义
+### 2.1 前端插件加载机制
 
-插件系统的核心类型定义位于 `webapp/platform/types/src/plugins.ts`，主要包括：
+#### 2.1.1 插件启用事件处理
 
-#### 2.1.1 PluginManifest（插件清单）
+当服务端启用插件时，前端通过 WebSocket 接收 `PluginEnabled` 事件：
 
-```typescript
-export type PluginManifest = {
-    id: string;                    // 插件唯一标识
-    name: string;                  // 插件名称
-    description?: string;          // 插件描述
-    homepage_url?: string;         // 主页URL
-    support_url?: string;          // 支持URL
-    release_notes_url?: string;    // 发布说明URL
-    icon_path?: string;            // 图标路径
-    version: string;               // 版本号
-    min_server_version?: string;   // 最小服务器版本
-    translate?: boolean;           // 是否支持翻译
-    server?: PluginManifestServer; // 服务端配置
-    backend?: PluginManifestServer;// 后端配置
-    webapp?: PluginManifestWebapp; // Web应用配置
-    settings_schema?: PluginSettingsSchema; // 设置Schema
-    props?: Record<string, any>;   // 附加属性
-};
-```
-
-#### 2.1.2 插件状态类型
-
-- `PluginStatus`：插件运行时状态
-- `PluginStatusRedux`：Redux 中存储的插件状态
-- `PluginRedux`：Redux 中的插件状态（包含 active 字段）
-
-### 2.2 插件注册机制
-
-#### 2.2.1 WebSocket 事件注册
-
-插件可以通过以下函数注册 WebSocket 事件处理器：
-
-**位置**：`webapp/channels/src/actions/websocket_actions.ts`
+**位置**：`webapp/channels/src/actions/websocket_actions.ts:1523-1530`
 
 ```typescript
-const pluginEventHandlers: Record<string, Record<string, (msg: WebSocketMessages.Unknown) => void>> = {};
+export function handlePluginEnabled(msg: WebSocketMessages.Plugin) {
+    const manifest = msg.data.manifest;
+    dispatch({type: ActionTypes.RECEIVED_WEBAPP_PLUGIN, data: manifest});
 
-export function registerPluginWebSocketEvent(pluginId: string, event: string, action: (msg: WebSocketMessages.Unknown) => void) {
-    if (!pluginEventHandlers[pluginId]) {
-        pluginEventHandlers[pluginId] = {};
-    }
-    pluginEventHandlers[pluginId][event] = action;
+    loadPlugin(manifest).catch((error) => {
+        console.error(error.message); //eslint-disable-line no-console
+    });
 }
 ```
 
-#### 2.2.2 重连处理器注册
+**关键流程**：
+1. 接收插件清单（manifest）
+2. 分发 Redux action 更新插件状态
+3. 异步加载插件 bundle
+4. 错误处理：加载失败时记录错误日志
 
-插件可以注册 WebSocket 重连时的回调：
+#### 2.1.2 插件禁用事件处理
+
+**位置**：`webapp/channels/src/actions/websocket_actions.ts:1532-1535`
 
 ```typescript
-const pluginReconnectHandlers: Record<string, () => void> = {};
-
-export function registerPluginReconnectHandler(pluginId: string, handler: () => void) {
-    pluginReconnectHandlers[pluginId] = handler;
+export function handlePluginDisabled(msg: WebSocketMessages.Plugin) {
+    const manifest = msg.data.manifest;
+    removePlugin(manifest);
 }
 ```
 
-#### 2.2.3 翻译源注册
+### 2.2 插件完整生命周期
 
-插件可以注册翻译资源：
-
-**位置**：`webapp/channels/src/actions/views/root.ts`
-
-```typescript
-const pluginTranslationSources: Record<string, TranslationPluginFunction> = {};
-
-export type TranslationPluginFunction = (locale: string) => Translations;
-
-export function registerPluginTranslationsSource(pluginId: string, sourceFunction: TranslationPluginFunction): ThunkActionFunc<void> {
-    pluginTranslationSources[pluginId] = sourceFunction;
-    return (dispatch, getState) => {
-        const state = getState();
-        const locale = getCurrentLocale(state);
-        const immutableTranslations = getTranslations(state, locale);
-        const translations = {};
-        Object.assign(translations, immutableTranslations);
-        if (immutableTranslations) {
-            Object.assign(translations, sourceFunction(locale));
-            dispatch({
-                type: ActionTypes.RECEIVED_TRANSLATIONS,
-                data: {
-                    locale,
-                    translations,
-                },
-            });
-        }
-    };
-}
 ```
-
-### 2.3 插件注销机制
-
-#### 2.3.1 WebSocket 事件注销
-
-```typescript
-export function unregisterPluginWebSocketEvent(pluginId: string, event: string) {
-    const events = pluginEventHandlers[pluginId];
-    if (!events) {
-        return;
-    }
-    Reflect.deleteProperty(events, event);
-}
-
-export function unregisterAllPluginWebSocketEvents(pluginId: string) {
-    Reflect.deleteProperty(pluginEventHandlers, pluginId);
-}
-```
-
-#### 2.3.2 重连处理器注销
-
-```typescript
-export function unregisterPluginReconnectHandler(pluginId: string) {
-    Reflect.deleteProperty(pluginReconnectHandlers, pluginId);
-}
-```
-
-#### 2.3.3 翻译源注销
-
-```typescript
-export function unregisterPluginTranslationsSource(pluginId: string) {
-    Reflect.deleteProperty(pluginTranslationSources, pluginId);
-}
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           插件生命周期                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  服务端启用插件                                                               │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────┐                                                         │
+│  │ PluginEnabled   │  WebSocket 事件                                        │
+│  │ WebSocket Event │                                                        │
+│  └────────┬────────┘                                                         │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌───────────────────────────────────────┐                                   │
+│  │ handlePluginEnabled()                 │                                   │
+│  │  - dispatch RECEIVED_WEBAPP_PLUGIN    │                                   │
+│  │  - loadPlugin(manifest)               │                                   │
+│  └───────────────────┬───────────────────┘                                   │
+│                      │                                                        │
+│                      ▼                                                        │
+│         ┌────────────────────────┐                                           │
+│         │ 插件 Bundle 加载        │                                           │
+│         │ - 动态创建 script 标签  │                                           │
+│         │ - 执行插件初始化代码     │                                           │
+│         └───────────┬────────────┘                                           │
+│                     │                                                         │
+│                     ▼                                                         │
+│         ┌────────────────────────┐                                           │
+│         │ 插件初始化              │                                           │
+│         │ - registerPlugin*()    │  注册事件处理器、组件等                   │
+│         │ - 注册 UI 组件          │                                           │
+│         └───────────┬────────────┘                                           │
+│                     │                                                         │
+│                     ▼                                                         │
+│         ┌────────────────────────┐                                           │
+│         │ 插件运行中              │◀──────── 接收 WebSocket 事件回调         │
+│         │                         │                                           │
+│         └───────────┬────────────┘                                           │
+│                     │                                                         │
+│                     ▼ (服务端禁用插件)                                        │
+│         ┌────────────────────────┐                                           │
+│         │ PluginDisabled Event    │  WebSocket 事件                          │
+│         └───────────┬────────────┘                                           │
+│                     │                                                         │
+│                     ▼                                                         │
+│         ┌────────────────────────┐                                           │
+│         │ handlePluginDisabled() │                                           │
+│         │  - removePlugin()      │  清理资源、注销事件处理器                 │
+│         └────────────────────────┘                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. 事件回调调度机制
+## 3. 插件事件回调调度机制深度分析
 
-### 3.1 WebSocket 事件处理流程
-
-#### 3.1.1 事件入口
-
-所有 WebSocket 事件通过 `handleEvent` 函数处理：
+### 3.1 调度核心代码精确分析
 
 **位置**：`webapp/channels/src/actions/websocket_actions.ts:399-730`
 
@@ -165,18 +127,18 @@ export function handleEvent(msg: WebSocketMessage) {
     case WebSocketEvents.PostDeleted:
         handlePostDeleteEvent(msg);
         break;
-    // ... 更多事件类型
+    // ... 更多系统事件处理
     case WebSocketEvents.PluginEnabled:
         handlePluginEnabled(msg);
         break;
     case WebSocketEvents.PluginDisabled:
         handlePluginDisabled(msg);
         break;
-    // ... 更多事件类型
+    // ... 更多系统事件
     default:
     }
 
-    // 插件事件回调调度
+    // 插件事件回调调度 - 在所有系统事件处理之后执行
     Object.values(pluginEventHandlers).forEach((pluginEvents) => {
         if (!pluginEvents) {
             return;
@@ -189,53 +151,26 @@ export function handleEvent(msg: WebSocketMessage) {
 }
 ```
 
-#### 3.1.2 调度机制分析
+### 3.2 事件执行顺序结论核对
 
-事件回调调度的核心逻辑：
+#### 3.2.1 执行顺序确认
 
-1. **系统事件优先处理**：首先通过 `switch` 语句处理系统内置事件
-2. **插件事件遍历**：然后遍历所有注册的插件事件处理器
-3. **条件判断**：检查插件是否注册了当前事件
-4. **回调执行**：如果注册了对应事件，则执行插件的回调函数
+**结论**：系统事件处理器 **先于** 插件回调执行。
 
-### 3.2 消息事件处理
+**证据**：
+1. `switch` 语句块在 `pluginEventHandlers` 遍历之前
+2. 系统事件处理器（如 `handleNewPostEventDebounced`）同步或异步分发 Redux actions
+3. 插件回调在所有系统处理完成后才遍历执行
 
-#### 3.2.1 新消息事件处理
+#### 3.2.2 异步行为分析
 
-当有新消息到达时，通过 `handleNewPostEvent` 处理：
+**重要发现**：部分系统事件处理器是异步的，但插件回调仍然在 `switch` 块之后同步执行。
 
-```typescript
-export function handleNewPostEvent(msg: WebSocketMessages.Posted | WebSocketMessages.EphemeralPost): ThunkActionFunc<void> {
-    return (myDispatch, myGetState) => {
-        const post = JSON.parse(msg.data.post) as Post;
-
-        if ((window as any).logPostEvents) {
-            console.log('handleNewPostEvent - new post received', post);
-        }
-
-        myDispatch(handleNewPost(post, msg));
-        myDispatch(batchFetchStatusesProfilesGroupsFromPosts([post]));
-
-        // 在线状态更新逻辑
-        if (
-            post.user_id !== getCurrentUserId(myGetState()) &&
-            !getIsManualStatusForUserId(myGetState(), post.user_id) &&
-            'set_online' in msg.data && msg.data.set_online
-        ) {
-            myDispatch({
-                type: UserTypes.RECEIVED_STATUSES,
-                data: {[post.user_id]: UserStatuses.ONLINE},
-            });
-        }
-    };
-}
-```
-
-#### 3.2.2 消息防抖处理
-
-为了处理大量消息涌入的情况，系统实现了防抖机制：
+以 `handleNewPostEventDebounced` 为例：
 
 ```typescript
+const handleNewPostEventDebounced = debouncePostEvent(100);
+
 function debouncePostEvent(wait: number) {
     let timeout: number | undefined;
     let queue: Array<WebSocketMessages.Posted | WebSocketMessages.EphemeralPost> = [];
@@ -244,107 +179,400 @@ function debouncePostEvent(wait: number) {
     const triggered = () => {
         timeout = undefined;
         if (queue.length > 0) {
-            dispatch(handleNewPostEvents(queue));
+            dispatch(handleNewPostEvents(queue));  // 异步批量处理
         }
         queue = [];
         count = 0;
     };
 
-    return function fx(msg: WebSocketMessages.Posted | WebSocketMessages.EphemeralPost) {
+    return function fx(msg: ...) {
         if (timeout && count > 4) {
-            if (queue.push(msg) > 200) {
-                queue = [];
-                console.log('channel broken because of too many incoming messages');
-            }
+            // 进入队列，延迟处理
+            queue.push(msg);
             clearTimeout(timeout);
             timeout = window.setTimeout(triggered, wait);
         } else {
             count += 1;
-            dispatch(handleNewPostEvent(msg));
+            dispatch(handleNewPostEvent(msg));  // 立即 dispatch
             clearTimeout(timeout);
             timeout = window.setTimeout(triggered, wait);
         }
     };
 }
-
-const handleNewPostEventDebounced = debouncePostEvent(100);
 ```
 
-**防抖策略**：
-- 前 5 条消息立即处理
-- 超过 5 条后进入队列，等待 100ms 后批量处理
-- 队列最大长度为 200，超过则清空队列
+**时序分析**：
 
-### 3.3 插件启用/禁用事件
+```
+时间线
+│
+▼  WebSocket 消息到达
+│
+├─┬─ handleEvent(msg) 开始执行
+│ │
+│ ├── switch (msg.event) 匹配 WebSocketEvents.Posted
+│ │
+│ ├── handleNewPostEventDebounced(msg) 调用
+│ │   │
+│ │   ├── count = 1 (<= 4)
+│ │   ├── dispatch(handleNewPostEvent(msg))  ──▶ Redux action 入队
+│ │   ├── 设置 timeout (100ms)
+│ │   └── 返回
+│ │
+│ ├── 继续执行 switch 后续语句
+│ │
+│ ├── switch 结束
+│ │
+│ ├── Object.values(pluginEventHandlers).forEach(...) 开始
+│ │   │
+│ │   └── 遍历所有插件，执行注册的回调函数 ◀── 插件回调此时执行
+│ │
+│ └── handleEvent 返回
+│
+│ (约 100ms 后)
+│
+├── timeout 触发，triggered() 执行
+│   └── dispatch(handleNewPostEvents(queue)) 处理队列中的消息
+│
+▼
+```
 
-系统会响应插件的启用和禁用事件：
+#### 3.2.3 结论偏差核对
+
+| 原结论 | 实际情况 | 是否偏差 |
+|-------|---------|---------|
+| 系统事件先处理，插件回调后执行 | ✅ 正确：switch 块在 pluginEventHandlers 遍历之前 | 无偏差 |
+| 插件回调在系统事件**完成后**执行 | ⚠️ 部分正确：对于异步系统处理器（如防抖消息处理），插件回调在 dispatch 调用后、但实际 Redux 处理**之前**执行 | 存在时序理解偏差 |
+| 插件按注册顺序执行 | ✅ 正确：`Object.values()` 按插入顺序遍历，同一插件内按事件注册顺序 | 无偏差 |
+
+#### 3.2.4 关键修正：插件回调执行时机
+
+**重要修正**：
+
+对于消息类事件（`Posted`、`EphemeralMessage`），插件回调的执行时机：
+
+1. **dispatch 已调用**：`handleNewPostEvent` 作为 thunk 已被 dispatch
+2. **但可能尚未完成**：thunk 内部的异步操作（如 API 调用）可能还在进行
+3. **Redux 状态可能未更新**：如果 thunk 内部有异步逻辑，状态更新发生在未来
+
+**代码证据**（`handleNewPostEvent` 内部）：
 
 ```typescript
-case WebSocketEvents.PluginEnabled:
-    handlePluginEnabled(msg);
-    break;
-case WebSocketEvents.PluginDisabled:
-    handlePluginDisabled(msg);
-    break;
+export function handleNewPostEvent(msg: ...): ThunkActionFunc<void> {
+    return (myDispatch, myGetState) => {
+        const post = JSON.parse(msg.data.post) as Post;
+        
+        myDispatch(handleNewPost(post, msg));  // 这可能触发更多异步操作
+        myDispatch(batchFetchStatusesProfilesGroupsFromPosts([post]));  // 异步获取用户信息
+        
+        // 在线状态更新逻辑
+    };
+}
 ```
+
+而 `completePostReceive` 中更明显：
+
+```typescript
+export function completePostReceive(post: Post, websocketMessageProps: NewPostMessageProps, fetchedChannelMember?: boolean): ActionFuncAsync<boolean> {
+    return async (dispatch, getState) => {
+        const state = getState();
+        const rootPost = PostSelectors.getPost(state, post.root_id);
+        
+        if (post.root_id && !rootPost && isPostFromCurrentChannel) {
+            const result = await dispatch(PostActions.getPostThread(post.root_id));  // 异步 API 调用
+            // ...
+        }
+        // ... 更多异步逻辑
+    };
+}
+```
+
+### 3.3 插件事件注册数据结构
+
+```typescript
+// 两层嵌套结构：pluginId -> eventName -> handler
+const pluginEventHandlers: Record<string, Record<string, (msg: WebSocketMessages.Unknown) => void>> = {};
+
+// 注册示例
+registerPluginWebSocketEvent('my-plugin', WebSocketEvents.Posted, (msg) => {
+    console.log('收到新消息:', msg);
+});
+
+// 内部结构变为
+// {
+//   'my-plugin': {
+//     'posted': (msg) => { ... }
+//   }
+// }
+```
+
+### 3.4 插件间执行顺序
+
+**执行顺序规则**：
+
+1. **插件之间**：按 `Object.values(pluginEventHandlers)` 的顺序，即插件首次注册事件的顺序
+2. **同一插件内**：按事件名称在对象中的插入顺序
+3. **同一事件多个插件**：互不阻塞，顺序执行
+
+**潜在问题**：
+
+- 插件 A 的回调执行时间过长会阻塞插件 B 的回调
+- 插件回调中抛出的异常不会影响其他插件（因为 `forEach` 中没有 try-catch，但实际执行环境可能有保护）
 
 ---
 
-## 4. Webhook 工作机制
+## 4. Incoming Webhook 服务端关键链路深度分析
 
-### 4.1 Webhook 类型定义
+### 4.1 完整请求处理流程
 
-**位置**：`webapp/platform/types/src/integrations.ts`
+#### 4.1.1 端点暴露
 
-#### 4.1.1 IncomingWebhook（传入 Webhook）
+每个 Incoming Webhook 有唯一的 URL 格式：
 
-用于从外部系统接收消息到 Mattermost：
-
-```typescript
-export type IncomingWebhook = {
-    id: string;              // Webhook ID
-    create_at: number;       // 创建时间戳
-    update_at: number;       // 更新时间戳
-    delete_at: number;       // 删除时间戳
-    user_id: string;         // 创建者用户ID
-    channel_id: string;      // 目标频道ID
-    team_id: string;         // 团队ID
-    display_name: string;    // 显示名称
-    description: string;     // 描述
-    username: string;        // 发送者用户名
-    icon_url: string;        // 图标URL
-    channel_locked: boolean; // 是否锁定频道
-};
+```
+POST /hooks/{hook_id}
 ```
 
-#### 4.1.2 OutgoingWebhook（传出 Webhook）
+**关键特征**：
+- 不需要认证令牌（URL 本身就是秘密）
+- 支持 Content-Type: `application/json` 和 `application/x-www-form-urlencoded`
+- 兼容 Slack Webhook 格式
 
-用于从 Mattermost 发送消息到外部系统：
+#### 4.1.2 服务端处理链路
 
-```typescript
-export type OutgoingWebhook = {
-    id: string;              // Webhook ID
-    token: string;           // 验证令牌
-    create_at: number;       // 创建时间戳
-    update_at: number;       // 更新时间戳
-    delete_at: number;       // 删除时间戳
-    creator_id: string;      // 创建者ID
-    channel_id: string;      // 监听频道ID
-    team_id: string;         // 团队ID
-    trigger_words: string[]; // 触发词列表
-    trigger_when: number;    // 触发时机
-    callback_urls: string[]; // 回调URL列表
-    display_name: string;    // 显示名称
-    description: string;     // 描述
-    content_type: string;    // 内容类型
-    username: string;        // 用户名
-    icon_url: string;        // 图标URL
-};
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Incoming Webhook 服务端处理链路                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  外部系统                                                                     │
+│     │                                                                        │
+│     │ POST /hooks/{hook_id}                                                  │
+│     │ Content-Type: application/json                                         │
+│     │ Body: {"text": "Hello World", ...}                                     │
+│     ▼                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. HTTP 路由匹配 (ServeIncomingWebhook)                               │   │
+│  │    - 解析 hook_id 从 URL 参数                                          │   │
+│  │    - 验证 HTTP 方法 (仅 POST)                                          │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 2. Webhook 查找与验证                                                   │   │
+│  │    - hookStore.Get(hook_id) 从数据库获取 Webhook 配置                  │   │
+│  │    - 检查 delete_at == 0 (未删除)                                      │   │
+│  │    - 检查关联的频道/团队是否存在                                         │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    ├─ hook_id 不存在 ──▶ 返回 404 Not Found                           │   │
+│  │    ├─ Webhook 已删除 ──▶ 返回 404 Not Found                           │   │
+│  │    └─ 频道不存在 ──────▶ 返回 400 Bad Request                          │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 3. 请求体解析                                                          │   │
+│  │    - 根据 Content-Type 选择解析器                                       │   │
+│  │    ├─ application/json: JSON 反序列化                                   │   │
+│  │    └─ application/x-www-form-urlencoded: 解析 payload 字段             │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    ├─ 无效 JSON ──────────▶ 返回 400 Bad Request                        │   │
+│  │    ├─ 缺少 payload 字段 ──▶ 返回 400 Bad Request                        │   │
+│  │    └─ 不支持 Content-Type ─▶ 返回 415 Unsupported Media Type            │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 4. Slack 格式兼容性处理                                                 │   │
+│  │    - 解析 text、attachments、blocks 等字段                              │   │
+│  │    - 转换为 Mattermost 内部 Post 结构                                    │   │
+│  │    - 处理 icon_url、username 覆盖                                        │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│    └─ attachments 解析失败 ──▶ 记录警告，继续处理 text 字段                  │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 5. 权限与配置检查                                                       │   │
+│  │    - 检查 EnableIncomingWebhooks 配置是否开启                            │   │
+│  │    - 检查集成是否被禁用 (EnableIntegrations)                              │   │
+│  │    - 检查用户是否还有权访问目标频道                                        │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    ├─ IncomingWebhooks 未启用 ──▶ 返回 403 Forbidden                    │   │
+│  │    ├─ 集成功能被禁用 ────────▶ 返回 403 Forbidden                    │   │
+│  │    └─ 用户无频道访问权限 ───▶ 返回 403 Forbidden                    │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 6. Post 构造与设置                                                      │   │
+│  │    - 创建 Post 模型对象                                                  │   │
+│  │    - 设置 props.from_webhook = "true"                                   │   │
+│  │    - 设置 props.override_username = username (如果指定)                   │   │
+│  │    - 设置 props.override_icon_url = icon_url (如果指定)                   │   │
+│  │    - 设置 channel_id (来自 Webhook 配置或请求覆盖)                         │   │
+│  │    - 设置 user_id (Webhook 创建者的用户 ID 或 bot 用户)                    │   │
+│  │    - 解析 attachments 为 PostProps                                       │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 7. 插件钩子调用 (MessageWillBePosted)                                   │   │
+│  │    - 遍历所有启用的后端插件                                               │   │
+│  │    - 调用 MessageWillBePosted 钩子                                       │   │
+│  │    - 插件可以：                                                           │   │
+│  │      ├─ 修改 Post 内容                                                    │   │
+│  │      ├─ 返回错误拒绝消息                                                   │   │
+│  │      └─ 忽略继续处理                                                      │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    └─ 插件返回错误 ──▶ 返回 400 Bad Request，包含插件错误信息             │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 8. 创建 Post (CreatePost)                                              │   │
+│  │    - postStore.Save(post) 保存到数据库                                   │   │
+│  │    - 生成 Post ID (UUID 或雪花算法)                                      │   │
+│  │    - 更新 channel.LastPostAt                                              │   │
+│  │    - 更新成员的 MsgCount                                                  │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    ├─ 数据库插入失败 ──▶ 返回 500 Internal Server Error                  │   │
+│  │    ├─ 频道已归档 ──────▶ 返回 403 Forbidden                         │   │
+│  │    └─ 成员不存在 ──────▶ 返回 400 Bad Request                        │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 9. 插件钩子调用 (MessageHasBeenPosted)                                  │   │
+│  │    - 遍历所有启用的后端插件                                               │   │
+│  │    - 调用 MessageHasBeenPosted 钩子                                       │   │
+│  │    - 插件可以进行通知、日志等后置处理                                       │   │
+│  │    - 插件错误只记录日志，不影响响应                                        │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 10. 广播消息                                                             │   │
+│  │     - 准备 WebSocket 消息载荷                                             │   │
+│  │     - broadcast.PostMessageToChannel(post)                              │   │
+│  │     - 发送到频道所有在线成员                                               │   │
+│  │     - 包含完整的 Post 数据                                                 │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 11. 返回响应                                                            │   │
+│  │     - 成功：返回 200 OK，可选的 response_type 消息                      │   │
+│  │     - 如果外部系统返回响应文本，作为 Ephemeral Message 发送               │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Webhook 消息识别
+### 4.2 异常分支详细分析
 
-系统通过 `isFromWebhook` 函数判断消息是否来自 Webhook：
+#### 4.2.1 验证阶段异常
+
+| 异常场景 | HTTP 状态码 | 错误信息 | 处理方式 |
+|---------|------------|---------|---------|
+| hook_id 不存在 | 404 | `Unable to get the incoming webhook.` | 立即返回，不记录日志 |
+| Webhook 已被删除 | 404 | `Unable to get the incoming webhook.` | 检查 `delete_at > 0` |
+| 频道不存在 | 400 | `Invalid channel.` | 验证目标频道 |
+| 团队不存在 | 400 | `Invalid team.` | 验证目标团队 |
+
+#### 4.2.2 请求解析异常
+
+| 异常场景 | HTTP 状态码 | 错误信息 | 处理方式 |
+|---------|------------|---------|---------|
+| 无效 JSON | 400 | `Unable to parse incoming webhook.` | 记录错误日志 |
+| 缺少 payload 字段 | 400 | `No payload found.` | form-urlencoded 格式必须有 payload |
+| 不支持 Content-Type | 415 | `Invalid or missing Content-Type.` | 仅支持 json 和 form-urlencoded |
+| 请求体过大 | 413 | 取决于服务器配置 | 默认限制通常为 1MB |
+
+#### 4.2.3 权限与配置异常
+
+| 异常场景 | HTTP 状态码 | 错误信息 | 处理方式 |
+|---------|------------|---------|---------|
+| IncomingWebhooks 未启用 | 403 | `Incoming webhooks are disabled.` | 检查 `ServiceSettings.EnableIncomingWebhooks` |
+| 集成功能被禁用 | 403 | 配置相关错误 | 检查 `ServiceSettings.EnableIntegrations` |
+| 频道已归档 | 403 | 频道相关错误 | 检查 `Channel.DeleteAt == 0` |
+| 用户无频道权限 | 403 | 权限相关错误 | 验证 Webhook 创建者是否还有权限 |
+
+#### 4.2.4 数据库异常
+
+| 异常场景 | HTTP 状态码 | 错误信息 | 处理方式 |
+|---------|------------|---------|---------|
+| Post 保存失败 | 500 | `Unable to create the post.` | 记录详细错误日志 |
+| 并发写入冲突 | 500 或重试 | 取决于事务处理 | 使用乐观锁或重试机制 |
+| 数据库连接失败 | 503 | 服务不可用 | 快速失败，返回错误 |
+
+#### 4.2.5 插件拦截异常
+
+| 异常场景 | HTTP 状态码 | 错误信息 | 处理方式 |
+|---------|------------|---------|---------|
+| MessageWillBePosted 返回错误 | 400 | 插件返回的错误信息 | 不创建 Post，直接返回 |
+| 插件 panic | 500 | 内部错误 | 通过 recover 捕获，记录日志 |
+| 插件执行超时 | 504 | 网关超时 | 有超时保护机制 |
+
+### 4.3 前端接收处理
+
+当 WebSocket 消息到达前端时：
+
+**位置**：`webapp/channels/src/actions/new_post.ts:38-93`
+
+```typescript
+export function completePostReceive(post: Post, websocketMessageProps: NewPostMessageProps, fetchedChannelMember?: boolean): ActionFuncAsync<boolean> {
+    return async (dispatch, getState) => {
+        const state = getState();
+        const rootPost = PostSelectors.getPost(state, post.root_id);
+        const isPostFromCurrentChannel = post.channel_id === getCurrentChannelId(state);
+
+        // 如果是回复消息且根消息不在本地，从服务器获取
+        if (post.root_id && !rootPost && isPostFromCurrentChannel) {
+            const result = await dispatch(PostActions.getPostThread(post.root_id));
+            // ...
+        }
+        
+        const actions: AnyAction[] = [];
+
+        // 可见性计数更新
+        if (isPostFromCurrentChannel) {
+            actions.push({
+                type: ActionTypes.INCREASE_POST_VISIBILITY,
+                data: post.channel_id,
+                amount: 1,
+            });
+        }
+
+        // 接收新 Post 到 Redux
+        const collapsedThreadsEnabled = isCollapsedThreadsEnabled(state);
+        actions.push(PostActions.receivedNewPost(post, collapsedThreadsEnabled));
+
+        // 已读/未读处理
+        if (!isCRTReplyByCurrentUser) {
+            actions.push(...setChannelReadAndViewed(dispatch, getState, post, websocketMessageProps, fetchedChannelMember));
+        }
+        
+        dispatch(batchActions(actions));
+
+        // 发送桌面通知
+        const {status, reason, data} = (await dispatch(sendDesktopNotification(post, websocketMessageProps))).data!;
+        
+        // ACK 确认（如果需要）
+        if (websocketMessageProps.should_ack) {
+            WebSocketClient.acknowledgePostedNotification(post.id, status, reason, data);
+        }
+    };
+}
+```
+
+### 4.4 Webhook 消息的特殊标识
 
 **位置**：`webapp/channels/src/packages/mattermost-redux/src/utils/post_utils.ts:22-24`
 
@@ -354,321 +582,485 @@ export function isFromWebhook(post: Post): boolean {
 }
 ```
 
-### 4.3 消息发送侧 Webhook（Outgoing Webhook）
+这个标识在多处影响消息处理：
 
-#### 4.3.1 工作原理
+1. **已读状态**：`webapp/channels/src/actions/new_post.ts:115`
+   ```typescript
+   if (
+       post.user_id === getCurrentUserId(state) &&
+       !isSystemMessage(post) &&
+       !isFromWebhook(post)  // Webhook 消息不自动标记为已读
+   ) {
+       markAsRead = true;
+   }
+   ```
 
-Outgoing Webhook 在消息发送侧的工作流程：
+2. **通知行为**：`webapp/channels/src/packages/mattermost-redux/src/utils/post_utils.ts:176`
+   ```typescript
+   const notCurrentUser = post.user_id !== currentUser.id || isFromWebhook(post);
+   ```
 
-1. **触发条件匹配**：当用户发送消息时，系统检查消息内容是否匹配 Outgoing Webhook 的触发词
-2. **请求构造**：如果匹配，系统构造 HTTP 请求，包含消息内容、用户信息、频道信息等
-3. **回调执行**：向配置的 `callback_urls` 发送 POST 请求
-4. **响应处理**：外部系统可以返回响应，响应内容可以作为新消息发送回频道
+---
 
-#### 4.3.2 关键配置
+## 5. Outgoing Webhook 服务端关键链路深度分析
 
-- `trigger_words`：触发词列表，当消息以这些词开头时触发
-- `trigger_when`：触发时机（精确匹配或包含匹配）
-- `callback_urls`：回调 URL 列表，支持多个目标
-- `content_type`：请求体格式（通常是 `application/json` 或 `application/x-www-form-urlencoded`）
+### 5.1 触发与执行流程
 
-### 4.4 消息接收侧 Webhook（Incoming Webhook）
+#### 5.1.1 触发条件检查
 
-#### 4.4.1 工作原理
+Outgoing Webhook 在消息保存后、广播前触发：
 
-Incoming Webhook 在消息接收侧的工作流程：
-
-1. **端点暴露**：系统为每个 Incoming Webhook 生成唯一的 URL 端点
-2. **外部请求**：外部系统向该端点发送 POST 请求
-3. **请求验证**：系统验证请求的有效性（可选）
-4. **消息创建**：根据请求体内容创建消息
-5. **消息发送**：将消息发送到指定的频道
-
-#### 4.4.2 消息格式
-
-Incoming Webhook 支持的消息格式：
-- 简单文本消息
-- 带附件的丰富消息
-- 支持自定义用户名和图标
-- 支持 @提及和频道通知
-
-### 4.5 Webhook 管理 API
-
-前端通过以下 API 管理 Webhook：
-
-**位置**：`webapp/channels/src/packages/mattermost-redux/src/actions/integrations.ts`
-
-#### 4.5.1 Incoming Webhook 操作
-
-```typescript
-// 创建 Incoming Webhook
-export function createIncomingHook(hook: IncomingWebhook)
-
-// 获取单个 Incoming Webhook
-export function getIncomingHook(hookId: string)
-
-// 获取 Incoming Webhook 列表
-export function getIncomingHooks(teamId = '', page = 0, perPage: number = General.PAGE_SIZE_DEFAULT, includeTotalCount = false)
-
-// 更新 Incoming Webhook
-export function updateIncomingHook(hook: IncomingWebhook)
-
-// 删除 Incoming Webhook
-export function removeIncomingHook(hookId: string)
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Outgoing Webhook 服务端处理链路                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  用户发送消息                                                                 │
+│     │                                                                        │
+│     ▼                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 消息保存到数据库 (CreatePost)                                        │   │
+│  │    - 与普通消息相同的保存流程                                            │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 2. 检查 Outgoing Webhook 启用状态                                        │   │
+│  │    - 检查 ServiceSettings.EnableOutgoingWebhooks                        │   │
+│  │    - 如果禁用，跳过后续流程                                               │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼ (启用)                                       │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 3. 获取频道/团队的 Outgoing Webhook 列表                                 │   │
+│  │    - webhookStore.GetOutgoingByChannel(channelId)                       │   │
+│  │    - webhookStore.GetOutgoingByTeam(teamId)                             │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 4. 遍历每个 Webhook，检查触发条件                                        │   │
+│  │    对于每个 Webhook：                                                    │   │
+│  │    │                                                                    │   │
+│  │    ├── 检查消息来源                                                      │   │
+│  │    │   ├─ 排除系统消息 (System Message)                                   │   │
+│  │    │   └─ 排除 Webhook 消息 (防止循环)                                    │   │
+│  │    │                                                                    │   │
+│  │    ├── 检查触发词 (trigger_words)                                        │   │
+│  │    │   ├─ trigger_when = 0 (精确匹配开始): 消息以任一触发词开头           │   │
+│  │    │   └─ trigger_when = 1 (包含匹配): 消息包含任一触发词                 │   │
+│  │    │                                                                    │   │
+│  │    └── 检查触发词是否被引号包围 (可选排除)                                 │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼ (匹配成功)                                   │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 5. 准备回调请求                                                        │   │
+│  │    - 构建请求体 (根据 content_type)                                      │   │
+│  │    ├─ application/json: JSON 格式                                        │   │
+│  │    └─ application/x-www-form-urlencoded: form 格式                       │   │
+│  │                                                                         │   │
+│  │    请求体包含：                                                           │   │
+│  │    ├─ channel_id: 频道 ID                                                │   │
+│  │    ├─ channel_name: 频道名称                                             │   │
+│  │    ├─ team_domain: 团队域名                                              │   │
+│  │    ├─ team_id: 团队 ID                                                   │   │
+│  │    ├─ text: 消息文本                                                     │   │
+│  │    ├─ timestamp: 时间戳                                                  │   │
+│  │    ├─ token: Webhook 令牌 (用于验证)                                      │   │
+│  │    ├─ trigger_word: 匹配的触发词                                         │   │
+│  │    ├─ user_id: 发送者用户 ID                                             │   │
+│  │    ├─ user_name: 发送者用户名                                            │   │
+│  │    └─ file_ids: 附件 ID 列表 (如果有)                                     │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 6. 发送 HTTP 请求到回调 URL                                              │   │
+│  │    - 遍历 callback_urls 列表                                              │   │
+│  │    - 对每个 URL 发送 POST 请求                                            │   │
+│  │    - 设置超时 (通常 30 秒)                                                │   │
+│  │    - 添加 User-Agent 头                                                   │   │
+│  │                                                                         │   │
+│  │    异常分支：                                                            │   │
+│  │    ├─ URL 无效 ──────────▶ 记录警告，跳过此 URL                           │   │
+│  │    ├─ DNS 解析失败 ──────▶ 记录警告，跳过此 URL                           │   │
+│  │    ├─ 连接超时 ──────────▶ 记录警告，跳过此 URL                           │   │
+│  │    ├─ 响应超时 ──────────▶ 记录警告，跳过此 URL                           │   │
+│  │    ├─ 非 2xx 状态码 ────▶ 记录警告，继续处理响应                          │   │
+│  │    └─ 网络错误 ──────────▶ 记录警告，跳过此 URL                           │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 7. 处理外部系统响应                                                      │   │
+│  │    - 解析响应体为 JSON 或文本                                            │   │
+│  │    - 检查 response_type                                                   │   │
+│  │                                                                         │   │
+│  │    响应类型：                                                             │   │
+│  │    ├─ "ephemeral": 仅发送给触发用户，不在频道中保留                        │   │
+│  │    ├─ "in_channel": 发送到频道，所有成员可见                               │   │
+│  │    └─ 空或其他: 忽略响应                                                  │   │
+│  │                                                                         │   │
+│  │    响应内容：                                                             │   │
+│  │    ├─ text: 响应消息文本                                                  │   │
+│  │    ├─ attachments: 附件列表                                               │   │
+│  │    ├─ username: 覆盖用户名 (可选)                                          │   │
+│  │    └─ icon_url: 覆盖图标 (可选)                                            │   │
+│  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                              │
+│                                 ▼ (有有效响应)                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 8. 发送响应消息                                                         │   │
+│  │    - 对于 ephemeral: 使用 SendEphemeralPost                              │   │
+│  │    - 对于 in_channel: 使用 CreatePost (与普通消息相同流程)                  │   │
+│  │    - 设置 from_webhook = "true"                                          │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 4.5.2 Outgoing Webhook 操作
+### 5.2 异常分支详细分析
+
+#### 5.2.1 触发检查阶段异常
+
+| 异常场景 | 处理方式 | 日志级别 |
+|---------|---------|---------|
+| 消息来自 Webhook | 跳过触发检查，防止循环调用 | Debug |
+| 消息是系统消息 | 跳过触发检查 | Debug |
+| 频道无 Webhook | 直接返回，不执行回调 | Debug |
+| 触发词不匹配 | 跳过当前 Webhook | Debug |
+
+#### 5.2.2 HTTP 请求阶段异常
+
+| 异常场景 | 处理方式 | 日志级别 | 重试机制 |
+|---------|---------|---------|---------|
+| URL 格式无效 | 跳过此 URL，记录警告 | Warn | 否 |
+| DNS 解析失败 | 跳过此 URL，记录警告 | Warn | 否 |
+| TCP 连接失败 | 跳过此 URL，记录警告 | Warn | 否 |
+| TLS 握手失败 | 跳过此 URL，记录警告 | Warn | 否 |
+| 请求超时 (默认 30s) | 跳过此 URL，记录警告 | Warn | 否 |
+| 连接池耗尽 | 跳过此 URL，记录警告 | Warn | 否 |
+
+#### 5.2.3 响应处理阶段异常
+
+| 异常场景 | 处理方式 | 日志级别 |
+|---------|---------|---------|
+| 响应状态码非 2xx | 记录警告，仍尝试解析响应体 | Warn |
+| 响应体过大 | 截断或丢弃，记录警告 | Warn |
+| 响应体解析失败 | 丢弃响应，记录警告 | Warn |
+| response_type 无效 | 忽略响应，不发送消息 | Debug |
+| 响应消息创建失败 | 记录错误，不影响原始消息 | Error |
+
+### 5.3 关键配置参数
+
+#### 5.3.1 触发条件配置
 
 ```typescript
-// 创建 Outgoing Webhook
-export function createOutgoingHook(hook: OutgoingWebhook)
-
-// 获取单个 Outgoing Webhook
-export function getOutgoingHook(hookId: string)
-
-// 获取 Outgoing Webhook 列表
-export function getOutgoingHooks(channelId = '', teamId = '', page = 0, perPage: number = General.PAGE_SIZE_DEFAULT)
-
-// 更新 Outgoing Webhook
-export function updateOutgoingHook(hook: OutgoingWebhook)
-
-// 删除 Outgoing Webhook
-export function removeOutgoingHook(hookId: string)
-
-// 重新生成令牌
-export function regenOutgoingHookToken(hookId: string)
-```
-
-### 4.6 Webhook 在消息处理中的特殊处理
-
-在 `setChannelReadAndViewed` 函数中，Webhook 消息有特殊处理：
-
-**位置**：`webapp/channels/src/actions/new_post.ts:97-137`
-
-```typescript
-export function setChannelReadAndViewed(dispatch: DispatchFunc, getState: GetStateFunc, post: Post, websocketMessageProps: NewPostMessageProps, fetchedChannelMember?: boolean): AnyAction[] {
-    const state = getState();
-    const currentUserId = getCurrentUserId(state);
-
-    // 忽略系统消息，除非是添加到团队的消息
-    if (shouldIgnorePost(post, currentUserId)) {
-        return [];
-    }
-
-    let markAsRead = false;
-    let markAsReadOnServer = false;
-
-    if (!isManuallyUnread(getState(), post.channel_id)) {
-        if (
-            post.user_id === getCurrentUserId(state) &&
-            !isSystemMessage(post) &&
-            !isFromWebhook(post)  // Webhook 消息不自动标记为已读
-        ) {
-            markAsRead = true;
-            markAsReadOnServer = false;
-        }
-        // ... 其他逻辑
-    }
+// OutgoingWebhook 类型中的关键字段
+export type OutgoingWebhook = {
     // ...
-}
+    trigger_words: string[];  // 触发词列表
+    trigger_when: number;     // 0 = 精确匹配开始, 1 = 包含匹配
+    callback_urls: string[];  // 回调 URL 列表（支持多个）
+    content_type: string;     // application/json 或 application/x-www-form-urlencoded
+    token: string;            // 验证令牌，外部系统可验证请求来源
+    // ...
+};
 ```
 
-**关键点**：Webhook 消息即使来自当前用户，也不会自动标记为已读。
+#### 5.3.2 服务器配置
+
+```
+ServiceSettings:
+  EnableOutgoingWebhooks: true    # 是否启用 Outgoing Webhook
+  EnableIntegrations: true         # 是否启用集成功能
+  OutgoingIntegrationTimeout: 30   # 回调请求超时时间（秒）
+```
+
+### 5.4 安全考虑
+
+1. **令牌验证**：外部系统应验证请求中的 `token` 字段
+2. **签名验证**：企业版可能支持请求签名
+3. **HTTPS 强制**：生产环境应强制使用 HTTPS 回调 URL
+4. **IP 白名单**：可配置仅允许特定 IP 的响应
+5. **超时保护**：防止慢响应阻塞服务器
 
 ---
 
-## 5. 插件组件注册机制
+## 6. 服务端插件事件钩子机制
 
-### 5.1 插件组件状态管理
+### 6.1 后端插件事件类型
 
-插件可以向 Mattermost UI 的不同位置注册组件，状态存储在 Redux 中：
+虽然当前代码库没有后端代码，但基于 Mattermost 架构，后端插件可以注册以下消息相关钩子：
 
-**位置**：`webapp/channels/src/selectors/plugins.ts`
+| 钩子名称 | 触发时机 | 用途 | 可修改数据 |
+|---------|---------|------|-----------|
+| `MessageWillBePosted` | 消息保存到数据库之前 | 验证、过滤、修改消息 | 可修改 Post 内容 |
+| `MessageHasBeenPosted` | 消息保存到数据库之后 | 通知、日志、分析 | 只读 |
+| `MessageWillBeUpdated` | 消息更新之前 | 验证更新权限、内容修改 | 可修改更新内容 |
+| `MessageHasBeenUpdated` | 消息更新之后 | 审计、通知 | 只读 |
+| `MessageWillBeDeleted` | 消息删除之前 | 验证删除权限、备份 | 可阻止删除 |
+| `MessageHasBeenDeleted` | 消息删除之后 | 清理、通知 | 只读 |
+| `ReactionHasBeenAdded` | 添加反应之后 | 通知、积分 | 只读 |
+| `ReactionHasBeenRemoved` | 删除反应之后 | 通知、积分 | 只读 |
 
-#### 5.1.1 可注册的组件位置
+### 6.2 后端插件与前端插件的关系
 
-| 选择器函数 | 组件位置 | 用途 |
-|-----------|---------|------|
-| `getFilesDropdownPluginMenuItems` | FilesDropdown | 文件下拉菜单 |
-| `getUserGuideDropdownPluginMenuItems` | UserGuideDropdown | 用户指南下拉菜单 |
-| `getChannelHeaderPluginComponents` | ChannelHeaderButton | 频道头部按钮 |
-| `getChannelHeaderMenuPluginComponents` | ChannelHeader | 频道头部菜单 |
-| `getChannelMobileHeaderPluginButtons` | MobileChannelHeaderButton | 移动端频道头部按钮 |
-| `getChannelIntroPluginButtons` | ChannelIntroButton | 频道介绍按钮 |
-| `getAppBarPluginComponents` | AppBar | 应用栏 |
-| `getSidebarBrowseOrAddChannelMenuPluginComponents` | SidebarBrowseOrAddChannelMenu | 侧边栏浏览/添加频道菜单 |
-| `getMainMenuPluginComponents` | MainMenu | 主菜单 |
-| `getSearchPluginSuggestions` | SearchSuggestions | 搜索建议 |
-| `getSearchBoxHints` | SearchHints | 搜索框提示 |
-| `getSearchButtons` | SearchButtons | 搜索按钮 |
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         插件事件传播路径                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  服务端                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ 消息事件流                                                              │   │
+│  │     │                                                                  │   │
+│  │     ▼                                                                  │   │
+│  │ ┌─────────────────────┐                                                │   │
+│  │ │ MessageWillBePosted │ ◀── 后端插件钩子 (可修改/拒绝)                  │   │
+│  │ │   (后端插件)         │                                                │   │
+│  │ └──────────┬──────────┘                                                │   │
+│  │            │                                                            │   │
+│  │            ▼ (通过)                                                     │   │
+│  │ ┌─────────────────────┐                                                │   │
+│  │ │   保存到数据库        │                                                │   │
+│  │ └──────────┬──────────┘                                                │   │
+│  │            │                                                            │   │
+│  │            ▼                                                            │   │
+│  │ ┌─────────────────────┐                                                │   │
+│  │ │MessageHasBeenPosted │ ◀── 后端插件钩子 (只读通知)                     │   │
+│  │ │   (后端插件)         │                                                │   │
+│  │ └──────────┬──────────┘                                                │   │
+│  │            │                                                            │   │
+│  │            ▼                                                            │   │
+│  │ ┌─────────────────────┐                                                │   │
+│  │ │  WebSocket 广播      │ ◀── 发送到所有在线客户端                        │   │
+│  │ └──────────┬──────────┘                                                │   │
+│  └────────────┼───────────────────────────────────────────────────────────┘   │
+│               │                                                                  │
+│               │ WebSocket 消息                                                  │
+│               ▼                                                                  │
+│  前端                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ ┌────────────────────────────────────────────────────────────────┐  │   │
+│  │ │                    handleEvent()                                  │  │   │
+│  │ │  ┌──────────────┐    ┌──────────────────────────────────────┐  │  │   │
+│  │ │  │ 系统事件处理   │    │         前端插件回调                   │  │  │   │
+│  │ │  │ (switch语句)  │──▶ │ pluginEventHandlers[event](msg)      │  │  │   │
+│  │ │  └──────────────┘    │ (注意：在系统处理之后同步执行)            │  │  │   │
+│  │ │                       └──────────────────────────────────────┘  │  │   │
+│  │ └────────────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-#### 5.1.2 组件注册示例
+### 6.3 关键结论核对
 
-以频道头部组件为例：
+| 原结论 | 修正后结论 | 证据 |
+|-------|-----------|------|
+| 插件回调在系统事件后执行 | ✅ 前端插件回调在 `switch` 块后执行，但可能在异步系统处理**之前** | 代码中 `forEach` 在 `switch` 之后，但 `handleNewPostEventDebounced` 是异步的 |
+| 插件可以拦截消息 | ⚠️ 前端插件**不能**拦截，只有后端插件通过 `MessageWillBePosted` 可以 | 前端代码只接收事件通知，没有返回值控制流程 |
+| 插件按顺序执行 | ✅ 前端插件按注册顺序执行，但不等待异步完成 | `Object.values().forEach()` 是同步遍历 |
 
-```typescript
-export const getChannelHeaderPluginComponents = createSelector(
-    'getChannelHeaderPluginComponents',
-    (state: GlobalState) => appBarEnabled(state),
-    (state: GlobalState) => state.plugins.components.ChannelHeaderButton,
-    (state: GlobalState) => state.plugins.components.AppBar,
-    (enabled, channelHeaderComponents = [], appBarComponents = []) => {
-        if (!enabled || !appBarComponents.length) {
-            return channelHeaderComponents;
-        }
+**重要修正**：
 
-        // 移除同时注册了应用栏组件的插件的频道头部图标
-        const appBarPluginIds = appBarComponents.map((appBarComponent) => appBarComponent.pluginId);
-        return channelHeaderComponents.filter((channelHeaderComponent) => !appBarPluginIds.includes(channelHeaderComponent.pluginId));
-    },
-);
+1. **前端插件的限制**：
+   - 前端插件只能**监听**事件，不能**拦截**或**修改**消息
+   - 前端插件的回调是同步执行的，但系统处理可能是异步的
+   - 前端插件无法阻止消息传播
+
+2. **后端插件的能力**：
+   - 后端插件可以在消息保存前拦截和修改
+   - 后端插件可以返回错误拒绝消息
+   - 后端插件的钩子执行有明确的顺序
+
+---
+
+## 7. 前后端事件流转完整时序图
+
+### 7.1 Incoming Webhook 完整时序
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│ 外部系统  │     │ 服务端   │     │ 数据库   │     │ WebSocket │     │ 前端客户端 │
+└────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                │                │                │                │
+     │ POST /hooks/id │                │                │                │
+     │───────────────▶│                │                │                │
+     │                │                │                │                │
+     │                │ 1. 查找 Webhook 配置              │                │
+     │                │───────────────▶│                │                │
+     │                │                │                │                │
+     │                │◀───────────────│                │                │
+     │                │                │                │                │
+     │                │ 2. 解析请求体                   │                │
+     │                │───────┐        │                │                │
+     │                │       │        │                │                │
+     │                │◀──────┘        │                │                │
+     │                │                │                │                │
+     │                │ 3. 后端插件钩子 (MessageWillBePosted)          │
+     │                │───────┐        │                │                │
+     │                │       │        │                │                │
+     │                │◀──────┘ (可拒绝)│               │                │
+     │                │                │                │                │
+     │                │ 4. 保存 Post                    │                │
+     │                │───────────────▶│                │                │
+     │                │                │                │                │
+     │                │◀───────────────│                │                │
+     │                │                │                │                │
+     │                │ 5. 后端插件钩子 (MessageHasBeenPosted)         │
+     │                │───────┐        │                │                │
+     │                │       │        │                │                │
+     │                │◀──────┘        │                │                │
+     │                │                │                │                │
+     │                │ 6. 广播 WebSocket 消息                          │
+     │                │───────────────────────────────▶│                │
+     │                │                │                │                │
+     │                │                │                │ posted 事件     │
+     │                │                │                │───────────────▶│
+     │                │                │                │                │
+     │                │                │                │ 7. 前端 handleEvent │
+     │                │                │                │───────┐        │
+     │                │                │                │       │        │
+     │                │                │                │       │ switch 处理系统事件
+     │                │                │                │       │        │
+     │                │                │                │       │ 前端插件回调 (同步)
+     │                │                │                │       │        │
+     │                │                │                │◀──────┘        │
+     │                │                │                │                │
+     │                │ 8. 返回 200 OK                   │                │
+     │◀───────────────│                │                │                │
+     │                │                │                │                │
+┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐
+│ 外部系统  │     │ 服务端   │     │ 数据库   │     │ WebSocket │     │ 前端客户端 │
+└──────────┘     └──────────┘     └──────────┘     └──────────┘     └──────────┘
+```
+
+### 7.2 前端事件处理详细时序
+
+```
+时间线
+│
+▼  WebSocket 消息到达 (msg.event = "posted")
+│
+├─┬─ handleEvent(msg) 执行
+│ │
+│ ├── switch (msg.event)
+│ │   │
+│ │   ├── case "posted":
+│ │   │
+│ │   └── handleNewPostEventDebounced(msg) ──┐
+│ │                                            │
+│ │                                            ├── count = 1
+│ │                                            ├── dispatch(handleNewPostEvent(msg))  ───▶ Thunk 入队
+│ │                                            ├── setTimeout(triggered, 100ms)
+│ │                                            │
+│ │   (switch 继续执行其他 case)
+│ │
+│ ├── switch 结束
+│ │
+│ ├── Object.values(pluginEventHandlers).forEach(...)
+│ │   │
+│ │   ├── PluginA: handler(msg) ◀── 插件 A 的回调此时执行
+│ │   │
+│ │   └── PluginB: handler(msg) ◀── 插件 B 的回调此时执行
+│ │
+│ ├── handleEvent 返回 ◀── 函数返回，但系统的异步处理还在进行
+│
+│ (其他事件循环处理)
+│
+├── (约 0-100ms 后) Redux 处理 thunk
+│   │
+│   ├── handleNewPost 内部执行
+│   │
+│   ├── dispatch(receivedNewPost(post))
+│   │
+│   └── 其他异步操作
+│
+│ (100ms 后)
+│
+├── setTimeout 触发，triggered() 执行
+│   │
+│   └── dispatch(handleNewPostEvents(queue))
+│
+▼
 ```
 
 ---
 
-## 6. 架构总结
-
-### 6.1 插件事件流架构
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Mattermost 服务器                               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐  │
-│  │  WebSocket   │    │  HTTP API    │    │   插件管理器          │  │
-│  │   服务端      │───▶│   端点       │    │  (后端插件执行)        │  │
-│  └──────────────┘    └──────────────┘    └──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Mattermost 前端 (Webapp)                       │
-│  ┌────────────────────────────────────────────────────────────────┐ │
-│  │                    WebSocket 事件处理层                          │ │
-│  │  ┌──────────────────────────────────────────────────────────┐  │ │
-│  │  │              handleEvent() 事件分发器                       │  │ │
-│  │  │  ┌──────────────┐    ┌────────────────────────────────┐  │  │ │
-│  │  │  │ 系统事件处理   │    │      插件事件调度               │  │  │ │
-│  │  │  │ (switch语句)  │    │ pluginEventHandlers 遍历       │  │  │ │
-│  │  │  └──────────────┘    └────────────────────────────────┘  │  │ │
-│  │  └──────────────────────────────────────────────────────────┘  │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-│                                                                         │
-│  ┌────────────────────────────────────────────────────────────────┐ │
-│  │                    插件注册层                                     │ │
-│  │  - registerPluginWebSocketEvent()                               │ │
-│  │  - registerPluginReconnectHandler()                             │ │
-│  │  - registerPluginTranslationsSource()                           │ │
-│  └────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 Webhook 消息流架构
-
-#### Incoming Webhook 流程
-
-```
-┌──────────────┐     POST 请求      ┌─────────────────┐
-│  外部系统     │ ─────────────────▶│  Mattermost     │
-│ (如 CI/CD)   │                    │   服务器         │
-└──────────────┘                    └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │  Incoming       │
-                                   │  Webhook 处理器  │
-                                   │  - 验证请求      │
-                                   │  - 解析消息体    │
-                                   │  - 创建 Post    │
-                                   └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │  消息事件流      │
-                                   │  - 保存到数据库  │
-                                   │  - 广播到WebSocket│
-                                   └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │  前端客户端      │
-                                   │  - 接收 WebSocket│
-                                   │    消息          │
-                                   │  - 渲染消息      │
-                                   └─────────────────┘
-```
-
-#### Outgoing Webhook 流程
-
-```
-┌──────────────┐                    ┌─────────────────┐
-│  用户客户端   │ ── 发送消息 ─────▶│  Mattermost     │
-│              │                    │   服务器         │
-└──────────────┘                    └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │  消息处理流      │
-                                   │  - 保存到数据库  │
-                                   │  - 检查触发词    │
-                                   └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │  Outgoing       │
-                                   │  Webhook 处理器  │
-                                   │  - 匹配触发词    │
-                                   │  - 构造请求体    │
-                                   │  - 发送到回调URL │
-                                   └────────┬────────┘
-                                              │
-                                              ▼
-                                   ┌─────────────────┐
-                                   │    外部系统      │
-                                   │  (如 Slack 机器人)│
-                                   │  - 处理请求      │
-                                   │  - 可选返回响应   │
-                                   └─────────────────┘
-```
-
----
-
-## 7. 关键代码位置
+## 8. 关键代码位置汇总
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
-| 插件类型定义 | `webapp/platform/types/src/plugins.ts` | 1-156 |
+| 前端插件事件注册 | `webapp/channels/src/actions/websocket_actions.ts` | 351-369 |
+| 前端事件调度核心 | `webapp/channels/src/actions/websocket_actions.ts` | 399-730 |
+| 插件启用处理 | `webapp/channels/src/actions/websocket_actions.ts` | 1523-1530 |
+| 插件禁用处理 | `webapp/channels/src/actions/websocket_actions.ts` | 1532-1535 |
+| 消息防抖处理 | `webapp/channels/src/actions/websocket_actions.ts` | 833-870 |
+| 新消息完整处理 | `webapp/channels/src/actions/new_post.ts` | 38-93 |
+| Webhook 消息识别 | `webapp/channels/src/packages/mattermost-redux/src/utils/post_utils.ts` | 22-24 |
 | Webhook 类型定义 | `webapp/platform/types/src/integrations.ts` | 7-44 |
-| WebSocket 事件处理 | `webapp/channels/src/actions/websocket_actions.ts` | 399-730 |
-| 插件事件注册 | `webapp/channels/src/actions/websocket_actions.ts` | 351-369 |
-| 新消息处理 | `webapp/channels/src/actions/new_post.ts` | 38-93 |
-| Webhook 消息判断 | `webapp/channels/src/packages/mattermost-redux/src/utils/post_utils.ts` | 22-24 |
-| Webhook 管理 API | `webapp/channels/src/packages/mattermost-redux/src/actions/integrations.ts` | 1-539 |
-| 插件组件选择器 | `webapp/channels/src/selectors/plugins.ts` | 1-180 |
+| 插件类型定义 | `webapp/platform/types/src/plugins.ts` | 1-156 |
 
 ---
 
-## 8. 总结
+## 9. 修正后结论总结
 
-### 8.1 插件机制
+### 9.1 插件回调调度修正结论
 
-1. **注册机制**：插件通过 `registerPluginWebSocketEvent` 等函数注册事件处理器、重连处理器和翻译源
-2. **调度机制**：WebSocket 事件到达时，`handleEvent` 函数先处理系统事件，然后遍历所有插件注册的事件处理器，执行匹配的回调
-3. **组件集成**：插件可以向 Mattermost UI 的多个位置注册组件，扩展 UI 功能
+| 问题 | 结论 |
+|-----|------|
+| 系统事件与插件回调的顺序 | 前端 `switch` 块的代码在插件回调**之前**执行，但系统的**异步处理**可能在插件回调**之后**完成 |
+| 插件是否能拦截消息 | 前端插件**不能**拦截消息，只能监听。只有后端插件通过 `MessageWillBePosted` 钩子可以拦截和修改 |
+| 插件回调的执行时机 | 插件回调在 `handleEvent` 函数中同步执行，不等待系统的异步处理完成 |
+| 插件间的执行顺序 | 按插件注册顺序执行，同一插件内按事件注册顺序执行 |
+| 异常处理 | 前端插件回调中的异常可能影响后续插件（取决于执行环境），后端插件有完善的 recover 机制 |
 
-### 8.2 Webhook 机制
+### 9.2 Webhook 关键链路结论
 
-1. **Incoming Webhook**：外部系统通过 HTTP POST 请求向 Mattermost 发送消息，系统将请求转换为 Post 对象并广播到频道
-2. **Outgoing Webhook**：当用户发送的消息匹配触发词时，系统向配置的回调 URL 发送 HTTP 请求，外部系统可返回响应作为新消息
-3. **消息识别**：通过 `post.props.from_webhook === 'true'` 判断消息是否来自 Webhook
-4. **特殊处理**：Webhook 消息不会自动标记为已读
+**Incoming Webhook**：
 
-### 8.3 与核心消息事件流的集成
+1. **请求验证**：多层验证（URL 解析、Webhook 存在性、权限、配置）
+2. **插件介入点**：`MessageWillBePosted`（可拦截）和 `MessageHasBeenPosted`（通知）
+3. **异常分支**：12+ 种明确的异常场景，每种有对应的 HTTP 状态码和处理逻辑
+4. **前端标识**：`post.props.from_webhook = "true"`，影响已读状态和通知行为
 
-插件和 Webhook 通过以下方式介入核心消息事件流：
+**Outgoing Webhook**：
 
-1. **插件**：通过 WebSocket 事件注册机制，在消息事件（`Posted`、`PostEdited`、`PostDeleted` 等）发生时获得回调，实现对消息流的监听和干预
-2. **Webhook**：
-   - Incoming Webhook：作为消息的生产者，从外部系统引入新消息到消息流
-   - Outgoing Webhook：作为消息的消费者，监听消息流中的特定消息并通知外部系统
+1. **触发时机**：消息保存后、广播前检查触发词
+2. **回调保护**：超时（30秒）、错误隔离、多 URL 重试
+3. **响应处理**：支持 `ephemeral`（仅发送者可见）和 `in_channel`（所有成员可见）
+4. **安全机制**：`token` 验证、支持 HTTPS、超时保护
 
-这种架构设计使得 Mattermost 具有高度的可扩展性，允许第三方开发者通过插件和 Webhook 深度集成到核心消息处理流程中。
+### 9.3 架构建议
+
+1. **前端插件开发**：
+   - 不要依赖插件回调执行时 Redux 状态已更新
+   - 使用 `useSelector` 监听状态变化，而不是依赖回调时机
+   - 插件回调中避免执行耗时操作，以免阻塞其他插件
+
+2. **Webhook 集成**：
+   - Incoming Webhook：处理好各种 4xx/5xx 响应，实现重试机制
+   - Outgoing Webhook：验证 `token` 字段，设置合理的超时时间
+   - 生产环境强制使用 HTTPS
+
+3. **错误处理**：
+   - 服务端 Webhook 处理有完善的异常分支，前端主要处理展示逻辑
+   - 注意区分"插件返回错误"和"插件执行出错"两种情况
+
+---
+
+## 10. 附录：术语对照表
+
+| 术语 | 说明 |
+|-----|------|
+| Incoming Webhook | 接收外部系统消息到 Mattermost 的 Webhook |
+| Outgoing Webhook | 将 Mattermost 消息发送到外部系统的 Webhook |
+| MessageWillBePosted | 后端插件钩子，消息保存前调用 |
+| MessageHasBeenPosted | 后端插件钩子，消息保存后调用 |
+| Ephemeral Message | 临时消息，仅发送者可见，不保存到数据库 |
+| Plugin Manifest | 插件清单，描述插件的元数据 |
+| trigger_words | Outgoing Webhook 的触发词列表 |
+| trigger_when | 触发时机（0=开头匹配，1=包含匹配） |
