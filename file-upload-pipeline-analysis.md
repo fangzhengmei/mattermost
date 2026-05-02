@@ -949,6 +949,1005 @@ func (a *App) attachFileIDsToPost(rctx request.CTX,
 
 ---
 
+## 2.4 客户端调用链与服务端状态协同
+
+### 2.4.1 普通上传的完整客户端调用链
+
+**Webapp 端当前实现** (基于实际代码分析):
+
+目前 Mattermost Webapp 只实现了普通上传 (`POST /api/v4/files`)，分片上传 API 存在于服务端但 Webapp 尚未使用（为桌面/移动应用预留）。
+
+**调用链流程图**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    普通上传 - 完整客户端调用链                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  用户交互层 (UI Components)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  FileUpload 组件                                                            │
+  │  ├── 拖放文件 (handleDrop)                                                  │
+  │  ├── 粘贴图片 (pasteUpload)                                                 │
+  │  ├── 快捷键上传 (keyUpload: Ctrl/Cmd + U)                                  │
+  │  └── 按钮选择 (simulateInputClick)                                          │
+  │                                                                              │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │                    use_upload_files.tsx (Hook)                        │  │
+  │  │  ├── handleUploadStart: clientIds 加入 uploadsInProgress             │  │
+  │  │  ├── handleUploadProgress: 更新进度百分比                              │  │
+  │  │  ├── handleFileUploadComplete: 更新 draft.fileInfos                   │  │
+  │  │  └── handleUploadError: 错误处理，移除上传中状态                       │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  Redux Action 层
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  file_actions.ts: uploadFile()                                             │
+  │  ├── 1. dispatch({type: UPLOAD_FILES_REQUEST})                            │
+  │  ├── 2. 创建 XMLHttpRequest                                                │
+  │  ├── 3. 设置请求头 (Authorization, Accept: application/json)              │
+  │  ├── 4. 构建 FormData:                                                    │
+  │  │       ├── channel_id                                                    │
+  │  │       ├── client_ids (客户端生成的临时 ID)                              │
+  │  │       └── files (文件内容，放在最后以支持流式上传)                      │
+  │  ├── 5. 注册回调:                                                          │
+  │  │       ├── xhr.upload.onprogress: 进度更新                              │
+  │  │       ├── xhr.onload: 响应处理                                          │
+  │  │       └── xhr.onerror: 错误处理                                         │
+  │  └── 6. xhr.send(formData)                                                 │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  网络传输层
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  POST /api/v4/files                                                         │
+  │  Content-Type: multipart/form-data; boundary=...                          │
+  │                                                                              │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  请求体 (multipart/form-data):                                          │  │
+  │  │  ├── Content-Disposition: form-data; name="channel_id"                │  │
+  │  │  │   "abc123" (目标频道 ID)                                            │  │
+  │  │  ├── Content-Disposition: form-data; name="client_ids"                │  │
+  │  │  │   "client_xyz" (客户端生成的临时 ID)                                 │  │
+  │  │  └── Content-Disposition: form-data; name="files"; filename="photo.jpg"│  │
+  │  │      Content-Type: image/jpeg                                          │  │
+  │  │      [文件二进制数据]                                                   │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  响应处理
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  成功响应 (HTTP 201 Created):                                               │
+  │  {                                                                          │
+  │    "file_infos": [                                                          │
+  │      {                                                                       │
+  │        "id": "file_abc123",         ← 服务端生成的 file_id                │
+  │        "name": "photo.jpg",                                                 │
+  │        "size": 1048576,                                                     │
+  │        "mime_type": "image/jpeg",                                           │
+  │        "post_id": "",                 ← 暂未关联消息                        │
+  │        ...                                                                   │
+  │      }                                                                       │
+  │    ],                                                                       │
+  │    "client_ids": ["client_xyz"]      ← 对应客户端传入的 client_id         │
+  │  }                                                                          │
+  │                                                                              │
+  │  后续:                                                                       │
+  │  ├── dispatch(RECEIVED_UPLOAD_FILES) → 保存到 Redux store                 │
+  │  ├── draft.uploadsInProgress → draft.fileInfos (状态转换)                  │
+  │  └── 等待用户发送消息时关联到 Post                                          │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+**核心代码分析** (`webapp/channels/src/actions/file_actions.ts:32-155`):
+
+```typescript
+export function uploadFile({
+    file, name, type, rootId, channelId, clientId,
+    onProgress, onSuccess, onError
+}: UploadFile, isBookmark?: boolean): ThunkActionFunc<XMLHttpRequest> {
+    return (dispatch, getState) => {
+        // 1. 发起请求 Action
+        dispatch({type: FileTypes.UPLOAD_FILES_REQUEST});
+
+        // 2. 构建 URL
+        let url = Client4.getFilesRoute();
+        if (isBookmark) {
+            url += '?bookmark=true';
+        }
+
+        // 3. 创建 XMLHttpRequest (不使用 fetch 以便支持进度回调)
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+
+        // 4. 设置认证头
+        const client4Headers = Client4.getOptions({method: 'POST'}).headers;
+        Object.keys(client4Headers).forEach((client4Header) => {
+            const client4HeaderValue = client4Headers[client4Header];
+            if (client4HeaderValue) {
+                xhr.setRequestHeader(client4Header, client4HeaderValue);
+            }
+        });
+        xhr.setRequestHeader('Accept', 'application/json');
+
+        // 5. 构建 FormData
+        const formData = new FormData();
+        formData.append('channel_id', channelId);
+        formData.append('client_ids', clientId);
+        formData.append('files', file, name); // 文件放在最后以支持流式上传
+
+        // 6. 进度回调
+        if (onProgress && xhr.upload) {
+            xhr.upload.onprogress = (event) => {
+                const percent = Math.floor((event.loaded / event.total) * 100);
+                const filePreviewInfo = {
+                    clientId, name, percent, type
+                } as FilePreviewInfo;
+                onProgress(filePreviewInfo);
+            };
+        }
+
+        // 7. 成功回调
+        if (onSuccess) {
+            xhr.onload = () => {
+                if (xhr.status === 201 && xhr.readyState === 4) {
+                    const response = JSON.parse(xhr.response);
+                    // 映射 file_id 和 client_id
+                    const data = response.file_infos.map((fileInfo: FileInfo, index: number) => {
+                        return {
+                            ...fileInfo,
+                            clientId: response.client_ids[index],
+                        };
+                    });
+
+                    dispatch(batchActions([
+                        {
+                            type: FileTypes.RECEIVED_UPLOAD_FILES,
+                            data,
+                            channelId,
+                            rootId,
+                        },
+                        {
+                            type: FileTypes.UPLOAD_FILES_SUCCESS,
+                        },
+                    ]));
+
+                    onSuccess(response, channelId, rootId);
+                } else if (xhr.status >= 400 && xhr.readyState === 4) {
+                    // HTTP 错误处理
+                    dispatch({
+                        type: FileTypes.UPLOAD_FILES_FAILURE,
+                        clientIds: [clientId],
+                        channelId,
+                        rootId,
+                    });
+                    onError?.(errorMessage, clientId, channelId, rootId);
+                }
+            };
+        }
+
+        // 8. 网络错误回调
+        if (onError) {
+            xhr.onerror = () => {
+                if (xhr.readyState === 4 && xhr.responseText.length !== 0) {
+                    // 有响应内容的错误
+                    const errorResponse = JSON.parse(xhr.response);
+                    forceLogoutIfNecessary(errorResponse, dispatch, getState);
+                    onError(errorResponse, clientId, channelId, rootId);
+                } else {
+                    // 网络中断或超时
+                    const errorMessage = xhr.status === 0 || !xhr.status 
+                        ? 'There was a problem uploading your files.'
+                        : 'Unexpected status code: ' + xhr.status;
+                    dispatch({
+                        type: FileTypes.UPLOAD_FILES_FAILURE,
+                        clientIds: [clientId],
+                        channelId,
+                        rootId,
+                    });
+                    onError({message: errorMessage}, clientId, channelId, rootId);
+                }
+            };
+        }
+
+        // 9. 发送请求
+        xhr.send(formData);
+
+        return xhr;
+    };
+}
+```
+
+### 2.4.2 分片上传的理想客户端调用链 (基于服务端 API 设计)
+
+虽然 Webapp 尚未实现分片上传，但服务端 API 已完整设计。以下是基于服务端测试代码分析的理想客户端实现：
+
+**API 端点回顾**:
+
+| 端点 | 方法 | 请求体 | 响应 | 说明 |
+|------|------|--------|------|------|
+| `/api/v4/uploads` | POST | `{filename, file_size, channel_id, type}` | UploadSession | 创建上传会话 |
+| `/api/v4/uploads/{id}` | GET | 无 | UploadSession | 获取会话状态（权威进度） |
+| `/api/v4/uploads/{id}` | POST | 二进制数据或 multipart | 204 No Content 或 FileInfo | 上传数据块 |
+
+**完整调用链流程图**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    分片上传 - 理想客户端调用链                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  客户端状态机
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐       │
+  │  │  IDLE    │────▶│ CREATING │────▶│ UPLOADING│────▶│ COMPLETED│       │
+  │  │          │     │          │     │          │     │          │       │
+  │  └──────────┘     └──────────┘     └────┬─────┘     └──────────┘       │
+  │                                          │                                   │
+  │                                          ▼                                   │
+  │                                    ┌──────────┐                            │
+  │                                    │  FAILED  │                            │
+  │                                    │          │                            │
+  │                                    └────┬─────┘                            │
+  │                                         │                                   │
+  │                                         ▼                                   │
+  │                                    ┌──────────┐                            │
+  │                                    │ RESUMING │                            │
+  │                                    │ 查询权威  │                            │
+  │                                    │  进度    │                            │
+  │                                    └────┬─────┘                            │
+  │                                         │                                   │
+  │                                         └────────────────▶ UPLOADING       │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+                                    │
+                                    ▼
+  详细交互流程
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  【阶段 1: 创建会话】                                                        │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  POST /api/v4/uploads                                                   │  │
+  │  │  Body: {                                                                 │  │
+  │  │    "filename": "large_file.zip",                                         │  │
+  │  │    "file_size": 209715200,        ← 必须预先知道总大小                │  │
+  │  │    "channel_id": "abc123",                                              │  │
+  │  │    "type": "attachment"           ← attachment 或 import               │  │
+  │  │  }                                                                       │  │
+  │  │                                                                           │  │
+  │  │  Response (HTTP 201 Created):                                            │  │
+  │  │  {                                                                       │  │
+  │  │    "id": "upload_xyz789",         ← 会话 ID，后续都用这个             │  │
+  │  │    "type": "attachment",                                                 │  │
+  │  │    "create_at": 1680000000000,                                         │  │
+  │  │    "user_id": "user_abc",                                                │  │
+  │  │    "channel_id": "abc123",                                               │  │
+  │  │    "filename": "large_file.zip",                                         │  │
+  │  │    "file_size": 209715200,                                              │  │
+  │  │    "file_offset": 0                ← 初始进度为 0                        │  │
+  │  │    // "path" 字段不返回给客户端（内部使用）                               │  │
+  │  │  }                                                                       │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  │  【阶段 2: 上传数据块】                                                      │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  POST /api/v4/uploads/upload_xyz789                                     │  │
+  │  │                                                                           │  │
+  │  │  支持两种请求格式:                                                        │  │
+  │  │                                                                           │  │
+  │  │  格式 A: 纯二进制 (推荐)                                                 │  │
+  │  │  ├── Content-Type: application/octet-stream                             │  │
+  │  │  └── Body: [二进制数据块]                                                │  │
+  │  │                                                                           │  │
+  │  │  格式 B: multipart/form-data                                             │  │
+  │  │  ├── Content-Type: multipart/form-data; boundary=...                    │  │
+  │  │  └── Body: 包含 name="data" 的 part                                     │  │
+  │  │                                                                           │  │
+  │  │  分片大小建议:                                                            │  │
+  │  │  ├── 首片: >= 5MB (minFirstPartSize)，除非是完整文件                    │  │
+  │  │  └── 后续片: 任意大小 (建议 8MB 或 16MB)                                │  │
+  │  │                                                                           │  │
+  │  │  响应:                                                                    │  │
+  │  │                                                                           │  │
+  │  │  情况 1: 上传未完成 (file_offset < file_size)                           │  │
+  │  │  ├── HTTP Status: 204 No Content                                        │  │
+  │  │  ├── Content-Length: 0                                                   │  │
+  │  │  └── 含义: 数据已接收，但文件尚未完整，继续上传                          │  │
+  │  │                                                                           │  │
+  │  │  情况 2: 上传完成 (file_offset == file_size)                            │  │
+  │  │  ├── HTTP Status: 201 Created 或 200 OK                                 │  │
+  │  │  └── Body: FileInfo 对象                                                 │  │
+  │  │       {                                                                   │  │
+  │  │         "id": "file_abc123",       ← 现在有了 file_id                  │  │
+  │  │         "name": "large_file.zip",                                        │  │
+  │  │         "size": 209715200,                                              │  │
+  │  │         "post_id": "",                                                    │  │
+  │  │         ...                                                               │  │
+  │  │       }                                                                   │  │
+  │  │                                                                           │  │
+  │  │  【重要】服务端不会返回更新后的 file_offset                              │  │
+  │  │  客户端必须通过 GET /uploads/{id} 查询                                   │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  │  【阶段 3: 失败后获取权威进度】                                              │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  触发场景:                                                               │  │
+  │  │  ├── 网络中断 (xhr.status === 0)                                        │  │
+  │  │  ├── 超时 (无响应)                                                       │  │
+  │  │  ├── 并发错误 (FileOffset mismatch)                                      │  │
+  │  │  └── 任何需要重新同步状态的场景                                           │  │
+  │  │                                                                           │  │
+  │  │  GET /api/v4/uploads/upload_xyz789                                       │  │
+  │  │                                                                           │  │
+  │  │  响应 (HTTP 200 OK):                                                     │  │
+  │  │  {                                                                       │  │
+  │  │    "id": "upload_xyz789",                                                │  │
+  │  │    "file_size": 209715200,                                              │  │
+  │  │    "file_offset": 62914560,       ← 【权威进度】服务端实际已接收 60MB │  │
+  │  │    ...                                                                   │  │
+  │  │  }                                                                       │  │
+  │  │                                                                           │  │
+  │  │  客户端操作:                                                              │  │
+  │  │  1. 比较本地记录的 offset 和服务端返回的 file_offset                     │  │
+  │  │  2. 如果服务端 > 本地: 说明上次请求部分成功，从服务端进度继续           │  │
+  │  │  3. 如果服务端 == 本地: 正常重试                                         │  │
+  │  │  4. 从 file.slice(file_offset) 读取数据，继续上传                        │  │
+  │  │                                                                           │  │
+  │  │  【关键设计】服务端是单一真值源 (Single Source of Truth)                │  │
+  │  │  客户端本地记录的进度仅供参考，任何时候都可能需要重新同步                 │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  │  【阶段 4: 从断点继续上传】                                                  │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  假设:                                                                   │  │
+  │  │  ├── 文件总大小: 200MB (209715200 bytes)                              │  │
+  │  │  ├── 上次成功写入: 60MB (服务端 file_offset = 62914560)               │  │
+  │  │  ├── 分片大小: 8MB                                                      │  │
+  │  │                                                                           │  │
+  │  │  继续上传:                                                               │  │
+  │  │  1. 计算剩余字节: 209715200 - 62914560 = 146800640 bytes             │  │
+  │  │  2. 从文件切片读取: file.slice(62914560)                               │  │
+  │  │  3. 分块发送剩余数据                                                     │  │
+  │  │                                                                           │  │
+  │  │  POST /api/v4/uploads/upload_xyz789                                      │  │
+  │  │  Body: file.slice(62914560, 62914560 + 8388608)  // 第2片 8MB        │  │
+  │  │                                                                           │  │
+  │  │  服务端处理:                                                              │  │
+  │  │  1. 获取 UploadSession: file_offset = 62914560                          │  │
+  │  │  2. 使用 AppendFile 追加到文件末尾                                       │  │
+  │  │  3. 更新 FileOffset: 62914560 + 8388608 = 71303168                    │  │
+  │  │  4. 保存到数据库                                                          │  │
+  │  │  5. 返回 204 No Content (未完成)                                         │  │
+  │  │                                                                           │  │
+  │  │  重复直到最后一片:                                                        │  │
+  │  │  最后一片发送后，服务端:                                                  │  │
+  │  │  1. FileOffset == FileSize ✓                                             │  │
+  │  │  2. 生成 FileInfo (图片后处理、生成缩略图等)                             │  │
+  │  │  3. 删除 UploadSession (清理临时状态)                                    │  │
+  │  │  4. 返回 FileInfo                                                         │  │
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.4.3 服务端测试代码中的分片上传示例
+
+从 `server/channels/api4/upload_test.go` 的测试用例可以看到完整的交互模式：
+
+```go
+// 测试: resume success (断点续传成功)
+func TestUploadData(t *testing.T) {
+    // ... 初始化
+    
+    us := &model.UploadSession{
+        ChannelId: th.BasicChannel.Id,
+        Filename:  "upload.zip",
+        FileSize:  8 * 1024 * 1024,  // 8MB 文件
+    }
+    
+    // 1. 创建上传会话
+    u, resp, err := th.Client.CreateUpload(context.Background(), us)
+    require.NoError(t, err)
+    require.Equal(t, http.StatusCreated, resp.StatusCode)
+    // u.FileOffset == 0
+    
+    // 2. 上传第一片 (5MB) - 模拟中断前的部分上传
+    rd := &io.LimitedReader{
+        R: bytes.NewReader(data),
+        N: 5 * 1024 * 1024,  // 只传 5MB
+    }
+    info, resp, err := th.Client.UploadData(context.Background(), u.Id, rd)
+    require.NoError(t, err)
+    require.Nil(t, info)                                    // 未完成，返回 nil
+    require.Equal(t, http.StatusNoContent, resp.StatusCode) // 204 No Content
+    
+    // 【关键点】此时服务端 FileOffset 已更新为 5MB
+    // 如果客户端崩溃，重启后需要通过 GET /uploads/{id} 查询
+    
+    // 3. 继续上传剩余数据 (从 5MB 开始)
+    // 注意: 这里不需要告诉服务端从哪里开始
+    // 服务端会根据 UploadSession.FileOffset 自动追加
+    info, _, err = th.Client.UploadData(
+        context.Background(), 
+        u.Id, 
+        bytes.NewReader(data[5*1024*1024:])  // 只传剩余部分
+    )
+    
+    // 4. 上传完成，返回 FileInfo
+    require.NoError(t, err)
+    require.NotEmpty(t, info)
+    require.Equal(t, u.Filename, info.Name)
+}
+```
+
+### 2.4.4 客户端与服务端状态协同机制
+
+**核心设计原则**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    状态协同 - 核心设计原则                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  原则 1: 服务端是单一真值源 (Single Source of Truth)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  客户端状态 (仅供参考)                    服务端状态 (权威)                  │
+  │  ┌─────────────────────┐                ┌─────────────────────┐           │
+  │  │ localOffset: 30MB   │                │                     │           │
+  │  │                     │   任何时候      │ UploadSession:      │           │
+  │  │ lastSentChunk: 3    │   可能不同步    │   FileOffset: 60MB │ ◀── 权威 │
+  │  │                     │                │   FileSize: 200MB  │           │
+  │  │ 【问题】网络中断后   │                │                     │           │
+  │  │  不知道实际进度      │                │ 【解决方案】         │           │
+  │  └─────────────────────┘                │ GET /uploads/{id}  │           │
+  │                                           │ 获取权威进度       │           │
+  │                                           └─────────────────────┘           │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  原则 2: 服务端使用双重并发控制防止状态不一致
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  POST /api/v4/uploads/{id} 时的校验流程:                                   │
+  │                                                                              │
+  │  1. 内存锁检查 (uploadLockMap)                                               │
+  │     ┌─────────────────────────────────────────────────────────────────┐    │
+  │     │ if uploadLockMap[sessionId] == true:                            │    │
+  │     │     return "concurrent upload error"                            │    │
+  │     │ else:                                                             │    │
+  │     │     uploadLockMap[sessionId] = true                             │    │
+  │     │     defer delete(uploadLockMap, sessionId)                      │    │
+  │     └─────────────────────────────────────────────────────────────────┘    │
+  │                                                                              │
+  │  2. 数据库级一致性校验 (强制读主库)                                          │
+  │     ┌─────────────────────────────────────────────────────────────────┐    │
+  │     │ // 强制从主库读取，防止从库延迟                                    │    │
+  │     │ rctx = rctx.With(RequestContextWithMaster)                      │    │
+  │     │                                                                     │    │
+  │     │ storedSession := db.GetUploadSession(sessionId)                 │    │
+  │     │                                                                     │    │
+  │     │ // 关键校验: 客户端认为的 offset 必须 == 服务端实际 offset         │    │
+  │     │ if clientSession.FileOffset != storedSession.FileOffset {       │    │
+  │     │     return "FileOffset mismatch"                                 │    │
+  │     │ }                                                                 │    │
+  │     └─────────────────────────────────────────────────────────────────┘    │
+  │                                                                              │
+  │  【校验失败后的客户端处理】                                                   │
+  │  ┌─────────────────────────────────────────────────────────────────┐    │
+  │  │ 收到 "FileOffset mismatch" 错误后:                               │    │
+  │  │                                                                     │    │
+  │  │  1. 暂停当前上传                                                    │    │
+  │  │  2. GET /uploads/{id} 获取权威进度                                 │    │
+  │  │  3. 从 file.slice(authoritativeOffset) 重新准备数据              │    │
+  │  │  4. 重试上传                                                        │    │
+  │  └─────────────────────────────────────────────────────────────────┘    │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  原则 3: At-Least-Once 写入语义
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │  服务端 UploadData 中的关键代码顺序:                                         │
+  │                                                                              │
+  │  // 1. 先写入存储                                                            │
+  │  written, err = a.WriteFile(lr, uploadPath)  // 或 AppendFile             │
+  │                                                                              │
+  │  // 2. 只要写入了数据，就推进 FileOffset                                     │
+  │  if written > 0 {                                                           │
+  │      us.FileOffset += written                                               │
+  │                                                                              │
+  │      // 3. 持久化到数据库                                                    │
+  │      if storeErr := a.Srv().Store().UploadSession().Update(us);           │
+  │         storeErr != nil {                                                   │
+  │          // 数据库更新失败，但文件已写入                                     │
+  │          // 这种情况可能需要人工干预                                         │
+  │          return nil, InternalServerError                                    │
+  │      }                                                                       │
+  │  }                                                                           │
+  │                                                                              │
+  │  // 4. 最后检查错误                                                          │
+  │  if err != nil {                                                             │
+  │      // 注意: 如果 written > 0，FileOffset 已经更新并持久化                 │
+  │      // 下次上传将从新的 offset 继续                                         │
+  │      return nil, err                                                         │
+  │  }                                                                           │
+  │                                                                              │
+  │  【含义】                                                                     │
+  │  ├── 数据一旦写入存储，就不会回滚                                            │
+  │  ├── FileOffset 单调递增，不会后退                                          │
+  │  ├── 客户端可以安全地从 file_offset 继续，不会重复写入已成功的数据          │
+  │  └── 但客户端需要处理"部分写入"的情况（通过 GET 获取权威进度）              │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.4.5 失败重试策略设计
+
+基于服务端 API 设计的理想客户端重试策略：
+
+```typescript
+// 伪代码: 分片上传的理想客户端实现
+interface ResumableUploadConfig {
+    file: File;
+    channelId: string;
+    chunkSize?: number;           // 建议 8MB 或 16MB
+    maxRetries?: number;          // 每片最大重试次数
+    retryDelay?: number;          // 重试延迟 (ms)
+    onProgress?: (offset: number, total: number) => void;
+    onComplete?: (fileInfo: FileInfo) => void;
+    onError?: (error: Error) => void;
+}
+
+class ResumableFileUploader {
+    private sessionId: string | null = null;
+    private fileOffset: number = 0;  // 本地记录的进度 (仅供参考)
+    private config: Required<ResumableUploadConfig>;
+    private abortController: AbortController | null = null;
+    
+    constructor(config: ResumableUploadConfig) {
+        this.config = {
+            chunkSize: 8 * 1024 * 1024,     // 默认 8MB
+            maxRetries: 3,
+            retryDelay: 1000,
+            ...config
+        };
+    }
+    
+    async start(): Promise<FileInfo> {
+        try {
+            // 阶段 1: 创建上传会话
+            if (!this.sessionId) {
+                const session = await this.createUploadSession();
+                this.sessionId = session.id;
+                this.fileOffset = session.file_offset;
+            }
+            
+            // 阶段 2: 循环上传直到完成
+            while (this.fileOffset < this.config.file.size) {
+                const result = await this.uploadNextChunk();
+                
+                if (result.type === 'complete') {
+                    this.config.onComplete?.(result.fileInfo);
+                    return result.fileInfo;
+                }
+                
+                // result.type === 'partial'
+                // 继续下一片
+            }
+            
+            throw new Error('Upload completed but no FileInfo returned');
+        } catch (error) {
+            this.config.onError?.(error as Error);
+            throw error;
+        }
+    }
+    
+    private async createUploadSession(): Promise<UploadSession> {
+        const response = await fetch('/api/v4/uploads', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                // Authorization header 由客户端框架处理
+            },
+            body: JSON.stringify({
+                filename: this.config.file.name,
+                file_size: this.config.file.size,
+                channel_id: this.config.channelId,
+                type: 'attachment'
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Failed to create upload session: ${response.status}`);
+        }
+        
+        return response.json();
+    }
+    
+    private async uploadNextChunk(): Promise<
+        { type: 'partial' } | 
+        { type: 'complete'; fileInfo: FileInfo }
+    > {
+        const chunkStart = this.fileOffset;
+        const chunkEnd = Math.min(
+            this.fileOffset + this.config.chunkSize,
+            this.config.file.size
+        );
+        
+        // 特殊处理: 首片必须 >= 5MB 除非是完整文件
+        if (this.fileOffset === 0 && 
+            chunkEnd - chunkStart < 5 * 1024 * 1024 &&
+            chunkEnd < this.config.file.size) {
+            // 扩展首片到至少 5MB
+            // ...
+        }
+        
+        const chunk = this.config.file.slice(chunkStart, chunkEnd);
+        
+        let lastError: Error | null = null;
+        
+        // 重试循环
+        for (let attempt = 0; attempt < this.config.maxRetries; attempt++) {
+            try {
+                this.abortController = new AbortController();
+                
+                const response = await fetch(
+                    `/api/v4/uploads/${this.sessionId}`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/octet-stream'
+                        },
+                        body: chunk,
+                        signal: this.abortController.signal
+                    }
+                );
+                
+                // 情况 1: 204 No Content - 上传未完成
+                if (response.status === 204) {
+                    // 【重要】服务端不返回新的 offset
+                    // 我们需要主动查询权威进度
+                    const authoritativeState = await this.getAuthoritativeState();
+                    this.fileOffset = authoritativeState.file_offset;
+                    
+                    this.config.onProgress?.(
+                        this.fileOffset,
+                        this.config.file.size
+                    );
+                    
+                    return { type: 'partial' };
+                }
+                
+                // 情况 2: 200/201 - 上传完成
+                if (response.status === 200 || response.status === 201) {
+                    const fileInfo = await response.json();
+                    return { type: 'complete', fileInfo };
+                }
+                
+                // 情况 3: 错误状态码
+                const errorBody = await response.text();
+                
+                // 特殊处理: FileOffset mismatch (并发冲突)
+                if (errorBody.includes('FileOffset mismatch') ||
+                    errorBody.includes('concurrent')) {
+                    // 查询权威进度并重试
+                    const authoritativeState = await this.getAuthoritativeState();
+                    this.fileOffset = authoritativeState.file_offset;
+                    
+                    // 重新准备 chunk (从新的 offset 开始)
+                    return { type: 'partial' };
+                }
+                
+                // 其他错误: 重试
+                throw new Error(`Upload failed: ${response.status} - ${errorBody}`);
+                
+            } catch (error) {
+                lastError = error as Error;
+                
+                // 网络错误 (fetch 抛出) 或 超时
+                // 查询权威进度后再决定
+                const authoritativeState = await this.getAuthoritativeState();
+                
+                if (authoritativeState.file_offset > this.fileOffset) {
+                    // 服务端已经接收了更多数据
+                    // 说明上次请求部分成功
+                    this.fileOffset = authoritativeState.file_offset;
+                    return { type: 'partial' };
+                }
+                
+                // 否则: 等待后重试
+                if (attempt < this.config.maxRetries - 1) {
+                    await this.delay(this.config.retryDelay * (attempt + 1));
+                }
+            }
+        }
+        
+        throw lastError || new Error('Upload failed after max retries');
+    }
+    
+    /**
+     * 获取权威进度 - 关键方法
+     * 任何时候客户端状态可能过期时都应该调用
+     */
+    private async getAuthoritativeState(): Promise<UploadSession> {
+        const response = await fetch(`/api/v4/uploads/${this.sessionId}`, {
+            method: 'GET',
+            // 可以添加 cache-control: no-cache 确保不使用缓存
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Failed to get upload state: ${response.status}`);
+        }
+        
+        return response.json();
+    }
+    
+    /**
+     * 恢复上传 (客户端崩溃后重启)
+     */
+    async resume(sessionId: string): Promise<FileInfo> {
+        this.sessionId = sessionId;
+        
+        // 【关键点】恢复时必须先查询权威进度
+        const authoritativeState = await this.getAuthoritativeState();
+        this.fileOffset = authoritativeState.file_offset;
+        
+        // 验证文件大小匹配
+        if (authoritativeState.file_size !== this.config.file.size) {
+            throw new Error('File size mismatch. Cannot resume upload.');
+        }
+        
+        // 继续上传
+        return this.start();
+    }
+    
+    cancel(): void {
+        this.abortController?.abort();
+    }
+    
+    private delay(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+```
+
+### 2.4.6 从上传状态到消息展示的完整收敛
+
+**两种上传方式的收敛点对比**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    收敛流程 - 从上传到消息展示                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  普通上传路径                              分片上传路径
+  ┌─────────────────────┐                   ┌─────────────────────┐
+  │                     │                   │                     │
+  │  POST /api/v4/files │                   │  1. POST /uploads   │
+  │  multipart/form-data│                   │  创建会话            │
+  │                     │                   │                     │
+  │  一次请求完成        │                   │  2. POST /uploads/  │
+  │                     │                   │  {id} (多次)        │
+  │  直接返回 FileInfo   │                   │  可能失败、重试      │
+  │                     │                   │  GET 查询权威进度     │
+  └──────────┬──────────┘                   │  ...                │
+             │                              └──────────┬──────────┘
+             │                                         │
+             ▼                                         ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         【收敛点: FileInfo】                                 │
+  │                                                                              │
+  │  两种上传方式最终输出完全相同的数据结构:                                      │
+  │                                                                              │
+  │  {                                                                           │
+  │    "id": "file_abc123",         ← 全局唯一的文件 ID                        │
+  │    "name": "report.pdf",                                                     │
+  │    "size": 1048576,                                                         │
+  │    "mime_type": "application/pdf",                                          │
+  │    "creator_id": "user_xyz",                                                │
+  │    "channel_id": "channel_abc",                                             │
+  │    "post_id": "",                  ← 【关键】初始为空，等待消息关联         │
+  │    "path": "20260502/teams/...",  ← 存储路径 (不返回给客户端)             │
+  │    "has_preview_image": false,                                              │
+  │    "width": 0,                                                              │
+  │    "height": 0,                                                             │
+  │    "mini_preview": null                                                     │
+  │  }                                                                           │
+  │                                                                              │
+  │  【重要】FileInfo 与上传方式完全解耦                                         │
+  │  后续流程不知道也不关心文件是怎么上传的                                       │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         阶段: 消息草稿管理                                   │
+  │                                                                              │
+  │  Webapp 中的 PostDraft 数据结构:                                            │
+  │                                                                              │
+  │  interface PostDraft {                                                      │
+  │    message: string;                     // 消息内容                          │
+  │    fileInfos: FileInfo[];              // 已上传完成的文件                  │
+  │    uploadsInProgress: string[];        // 上传中的 client_id 或 upload_id  │
+  │    // ...                                                                   │
+  │  }                                                                           │
+  │                                                                              │
+  │  状态转换:                                                                    │
+  │                                                                              │
+  │  普通上传:                                                                   │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  uploadStart(clientIds)                                               │  │
+  │  │     │                                                                  │  │
+  │  │     ▼                                                                  │  │
+  │  │  uploadsInProgress.push(clientId)                                     │  │
+  │  │     │                                                                  │  │
+  │  │     ▼ (上传完成)                                                       │  │
+  │  │  uploadComplete(fileInfos, clientIds)                                 │  │
+  │  │     │                                                                  │  │
+  │  │     ▼                                                                  │  │
+  │  │  fileInfos.push(...newFileInfos)                                      │  │
+  │  │  uploadsInProgress = uploadsInProgress.filter(id => !clientIds.includes(id))│
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  │  分片上传 (理想实现):                                                        │
+  │  ┌──────────────────────────────────────────────────────────────────────┐  │
+  │  │  1. 创建会话后:                                                        │  │
+  │  │     uploadsInProgress.push(uploadSessionId)                          │  │
+  │  │                                                                         │  │
+  │  │  2. 每片上传进度:                                                      │  │
+  │  │     更新 UI 显示: 60% complete                                        │  │
+  │  │     (但不修改 fileInfos，直到全部完成)                                │  │
+  │  │                                                                         │  │
+  │  │  3. 失败后:                                                            │  │
+  │  │     仍保留在 uploadsInProgress 中                                     │  │
+  │  │     显示 "上传失败，点击重试"                                          │  │
+  │  │                                                                         │  │
+  │  │  4. 重试时:                                                            │  │
+  │  │     GET /uploads/{id} 获取权威进度                                    │  │
+  │  │     从 file_offset 继续上传                                            │  │
+  │  │                                                                         │  │
+  │  │  5. 全部完成:                                                          │  │
+  │  │     fileInfos.push(fileInfo)                                          │  │
+  │  │     uploadsInProgress = uploadsInProgress.filter(id => id !== sessionId)│
+  │  └──────────────────────────────────────────────────────────────────────┘  │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         阶段: 发送消息                                       │
+  │                                                                              │
+  │  POST /api/v4/posts                                                         │
+  │  {                                                                           │
+  │    "channel_id": "channel_abc",                                            │
+  │    "message": "查看这个文件",                                                │
+  │    "file_ids": ["file_abc123", "file_def456"],  ← 引用 FileInfo.id       │
+  │    // ...                                                                   │
+  │  }                                                                           │
+  │                                                                              │
+  │  【关键】这里只传 file_id，不传任何上传相关的元数据                         │
+  │  服务端也不关心这些文件是怎么上传的                                           │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         阶段: 服务端消息关联                                 │
+  │                                                                              │
+  │  服务端 app/post_file_change.go 中的统一处理:                               │
+  │                                                                              │
+  │  processPostFileChanges(newPost, oldPost) {                                │
+  │      // 1. 从 Post.FileIds 获取新增的文件 ID                                │
+  │      addedFileIDs = 新的 file_ids - 旧的 file_ids                          │
+  │                                                                              │
+  │      // 2. 对每个新增的 file_id:                                            │
+  │      for fileID in addedFileIDs:                                            │
+  │          // 从 FileInfoStore 获取文件信息                                   │
+  │          fileInfo = FileInfoStore.GetForUser(                              │
+  │              fileID, userId, channelId                                     │
+  │          )                                                                  │
+  │                                                                              │
+  │          // 验证:                                                           │
+  │          // - 文件存在                                                       │
+  │          // - FileInfo.PostId == "" (未关联到其他消息)                     │
+  │          // - CreatorId 匹配当前用户                                        │
+  │          // - ChannelId 匹配                                                │
+  │                                                                              │
+  │          // 关联:                                                           │
+  │          FileInfoStore.AttachToPost(fileID, postId, userId)              │
+  │          // 更新 FileInfo.PostId = post.Id                                  │
+  │                                                                              │
+  │      // 3. 对每个删除的 file_id:                                            │
+  │      for fileID in removedFileIDs:                                          │
+  │          FileInfoStore.DeleteForPostByIds(postId, [fileID])               │
+  │          // 软删除: DeleteAt = now                                          │
+  │  }                                                                           │
+  │                                                                              │
+  │  【重要】整个过程与上传方式完全无关                                           │
+  │  只通过 FileInfo 表进行关联，不关心文件是如何上传的                          │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                             │
+                                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         阶段: 消息展示                                       │
+  │                                                                              │
+  │  客户端获取帖子后的渲染流程:                                                 │
+  │                                                                              │
+  │  1. GET /api/v4/posts 获取 Post 列表                                        │
+  │                                                                              │
+  │  2. 每个 Post 包含:                                                         │
+  │     {                                                                        │
+  │       "id": "post_xyz",                                                     │
+  │       "message": "...",                                                     │
+  │       "file_ids": ["file_abc123"],  ← 有序的文件 ID 列表                  │
+  │       // ...                                                                │
+  │     }                                                                        │
+  │                                                                              │
+  │  3. 服务端查询 (支持缓存):                                                   │
+  │     FileInfoStore.GetForPost(postId, fromCache=true)                       │
+  │     // 通过 PostId 反向查询关联的 FileInfo                                  │
+  │                                                                              │
+  │  4. 客户端渲染:                                                              │
+  │     for fileInfo in post.fileInfos:                                         │
+  │         if fileInfo.IsImage():                                              │
+  │             // 显示缩略图                                                    │
+  │             <img src="/api/v4/files/{fileId}/thumbnail" />                 │
+  │         else:                                                                │
+  │             // 显示文件图标和名称                                            │
+  │             <FileIcon type={fileInfo.MimeType} />                          │
+  │             <span>{fileInfo.Name}</span>                                    │
+  │                                                                              │
+  │  【关键点】                                                                   │
+  │  - Post.FileIds 决定显示顺序                                                 │
+  │  - FileInfo.PostId 用于反向查询                                              │
+  │  - 整个渲染流程与上传方式完全无关                                             │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.4.7 状态转换与收敛总结表
+
+| 阶段 | 普通上传状态 | 分片上传状态 | 收敛点 |
+|------|-------------|-------------|--------|
+| **上传中** | `uploadsInProgress: [clientId]` | `uploadsInProgress: [uploadSessionId]` | 都在 `uploadsInProgress` 中等待 |
+| **上传完成** | `fileInfos: [FileInfo]` | `fileInfos: [FileInfo]` | 相同的 `FileInfo` 结构 |
+| **草稿中** | `PostDraft.fileInfos` | `PostDraft.fileInfos` | 相同的草稿数据结构 |
+| **发送消息** | `Post.FileIds: [fileId]` | `Post.FileIds: [fileId]` | 相同的 `file_ids` 引用 |
+| **服务端关联** | `FileInfo.PostId = postId` | `FileInfo.PostId = postId` | 相同的关联逻辑 |
+| **消息展示** | 通过 `FileInfo.PostId` 查询 | 通过 `FileInfo.PostId` 查询 | 相同的渲染逻辑 |
+
+**核心设计洞察**:
+
+1. **上传方式与消息展示完全解耦**:
+   - 分片上传的复杂性（会话管理、断点续传、失败重试）完全封装在上传阶段
+   - 一旦生成 `FileInfo`，所有后续流程与普通上传完全一致
+
+2. **单一真值源设计**:
+   - 上传阶段: `UploadSession.FileOffset` 是权威进度
+   - 消息关联阶段: `FileInfo.PostId` 是权威关联
+   - 展示阶段: `Post.FileIds` 是权威顺序
+
+3. **状态持久化策略**:
+   - `UploadSession` 表: 临时状态，上传完成后删除
+   - `FileInfo` 表: 永久状态，PostId 初始为空，关联后更新
+   - `Post` 表: 包含 `FileIds` 数组，决定展示顺序
+
+---
+
 ## 3. 服务端 API 层与权限校验
 
 ### 3.1 API 端点概览
