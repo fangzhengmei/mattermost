@@ -46,16 +46,20 @@ Mattermost 的文件上传系统采用分层架构设计，从客户端到服务
 │  │  ┌─────────────────┐          ┌─────────────────────────────────────┐  │  │
 │  │  │ LocalFileBackend│          │ S3FileBackend (minio-go)            │  │  │
 │  │  │ 本地文件系统      │          │ AWS S3 / MinIO / 其他兼容存储        │  │  │
+│  │  │ WriteFile       │          │ WriteFile (multipart upload)        │  │  │
+│  │  │ AppendFile      │          │                                   │  │  │
 │  │  └─────────────────┘          └─────────────────────────────────────┘  │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 └─────────┬───────────────────┬────────────────────────────┼────────────────────┘
           │                   │                            │
           ▼                   ▼                            ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          数据层 (store/FileInfoStore)                          │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │  FileInfo 表: 存储文件元数据 (路径、尺寸、MIME类型、缩略图路径等)          │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
+│                          数据层 (store/)                                        │
+│  ┌─────────────────────────────┐    ┌─────────────────────────────────────┐  │
+│  │    FileInfoStore            │    │      UploadSessionStore             │  │
+│  │  存储文件元数据              │    │  存储分片上传会话状态                │  │
+│  │  (PostId, Path, Size等)    │    │  (FileOffset, FileSize, Path等)    │  │
+│  └─────────────────────────────┘    └─────────────────────────────────────┘  │
 └─────────┬────────────────────────────────────────────────────────────────────┘
           │
           ▼
@@ -64,6 +68,7 @@ Mattermost 的文件上传系统采用分层架构设计，从客户端到服务
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │  Post.FileIds ↔ FileInfo.PostId 双向关联                                  │  │
 │  │  processPostFileChanges: 创建/更新帖子时处理文件关联                      │  │
+│  │  普通上传和分片上传统一输出 FileInfo，收敛到同一消息关联机制              │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -92,9 +97,6 @@ Mattermost 支持两种文件上传模式，分别适用于不同场景：
 
 ```go
 func uploadFileStream(c *Context, w http.ResponseWriter, r *http.Request) {
-    // 解析请求，支持两种格式：
-    // 1. multipart/form-data (标准)
-    // 2. simple POST (body 为文件内容，参数在 URL)
     _, err := parseMultipartRequestHeader(r)
     switch err {
     case nil:
@@ -123,7 +125,6 @@ func uploadFileStream(c *Context, w http.ResponseWriter, r *http.Request) {
 **最小分片大小**: 5MB (`minFirstPartSize = 5 * 1024 * 1024`)
 
 ```go
-// 创建上传会话
 func createUpload(c *Context, w http.ResponseWriter, r *http.Request) {
     var us model.UploadSession
     json.NewDecoder(r.Body).Decode(&us)
@@ -135,6 +136,814 @@ func createUpload(c *Context, w http.ResponseWriter, r *http.Request) {
                us.Id + "/" + filepath.Base(us.Filename)
     
     rus, err := c.App.CreateUploadSession(c.AppContext, &us)
+}
+```
+
+---
+
+## 2.2 分片上传深度剖析
+
+### 2.2.1 UploadSession 数据模型
+
+**核心模型定义** (`server/public/model/upload_session.go`):
+
+```go
+type UploadSession struct {
+    Id          string       `json:"id"`           // 会话唯一标识
+    Type        UploadType   `json:"type"`         // 类型: attachment 或 import
+    CreateAt    int64        `json:"create_at"`    // 创建时间戳
+    UserId      string       `json:"user_id"`      // 上传用户 ID
+    ChannelId   string       `json:"channel_id,omitempty"` // 目标频道 (仅 attachment)
+    Filename    string       `json:"filename"`     // 文件名
+    Path        string       `json:"-"`            // 存储路径 (不序列化到客户端)
+    FileSize    int64        `json:"file_size"`    // 预期总大小
+    FileOffset  int64        `json:"file_offset"`  // 已接收字节数 (进度指针)
+    RemoteId    string       `json:"remote_id"`    // 共享频道远程标识
+    ReqFileId   string       `json:"req_file_id"`  // 共享频道请求文件ID
+}
+```
+
+**UploadType 枚举**:
+```go
+const (
+    UploadTypeAttachment   UploadType = "attachment"  // 消息附件
+    UploadTypeImport       UploadType = "import"      // 数据导入
+    IncompleteUploadSuffix            = ".tmp"         // 未完成文件后缀
+)
+```
+
+**状态判断规则**:
+```go
+// 上传未完成: FileOffset < FileSize
+// 上传已完成: FileOffset == FileSize
+if us.FileOffset != us.FileSize {
+    // 返回 nil 表示上传未完成，客户端继续上传
+    return nil, nil
+}
+```
+
+### 2.2.2 会话状态管理详解
+
+**状态机流转**:
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                    状态流转图                             │
+                    └─────────────────────────────────────────────────────────┘
+
+  ┌─────────────┐       ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+  │   CREATED   │──────▶│  UPLOADING  │──────▶│  RESUMABLE  │──────▶│  COMPLETED  │
+  │ FileOffset=0│       │  首片写入   │       │  断点续传   │       │ 生成FileInfo│
+  │ 存入数据库  │       │  ≥5MB或全量 │       │  AppendFile │       │ 删除Session │
+  └─────────────┘       └─────────────┘       └─────────────┘       └─────────────┘
+         │                      │                      │                      │
+         │                      │                      │                      │
+         ▼                      ▼                      ▼                      ▼
+  ┌─────────────┐       ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+  │ POST /uploads│       │ POST /uploads│       │ GET /uploads │      │POST /uploads│
+  │  创建会话    │       │  /{id} (首片)│       │  /{id} 查询  │      │ /{id} (末片)│
+  └─────────────┘       └─────────────┘       └─────────────┘       └─────────────┘
+```
+
+**双重并发控制机制** (`server/channels/app/upload.go:197-227`):
+
+```go
+func (a *App) UploadData(rctx request.CTX, us *model.UploadSession, rd io.Reader) (*model.FileInfo, *model.AppError) {
+    // ==================== 第一层: 内存级互斥锁 ====================
+    a.ch.uploadLockMapMut.Lock()
+    locked := a.ch.uploadLockMap[us.Id]
+    if locked {
+        // 同一 session 已有上传在进行，直接返回并发错误
+        a.ch.uploadLockMapMut.Unlock()
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.concurrent.app_error",
+            nil, "", http.StatusBadRequest)
+    }
+    a.ch.uploadLockMap[us.Id] = true
+    a.ch.uploadLockMapMut.Unlock()
+
+    // defer 在函数退出时释放锁
+    defer func() {
+        a.ch.uploadLockMapMut.Lock()
+        delete(a.ch.uploadLockMap, us.Id)  // 从映射中移除，而不是设为 false
+        a.ch.uploadLockMapMut.Unlock()
+    }()
+
+    // ==================== 第二层: 数据库级一致性校验 ====================
+    // 强制从主库读取，防止读从库导致的延迟问题
+    rctx = rctx.With(RequestContextWithMaster)
+    
+    storedSession, err := a.GetUploadSession(rctx, us.Id)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 关键校验: 客户端传来的 FileOffset 必须与数据库一致
+    if us.FileOffset != storedSession.FileOffset {
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.concurrent.app_error",
+            nil, "FileOffset mismatch", http.StatusBadRequest)
+    }
+    // ...
+}
+```
+
+**设计意图**:
+1. **内存锁**: 防止同一进程内的并发请求（如客户端快速重试）
+2. **数据库校验**: 防止跨进程/跨服务器的并发问题（如负载均衡环境）
+3. **主库读取**: `RequestContextWithMaster` 确保读取最新状态
+
+### 2.2.3 状态推进机制详解
+
+**核心推进逻辑** (`server/channels/app/upload.go:228-281`):
+
+```go
+// 限制读取字节数，防止超出预期大小
+lr := &io.LimitedReader{
+    R: rd,
+    N: us.FileSize - us.FileOffset,  // 只允许读取剩余字节
+}
+
+var written int64
+var err *model.AppError
+
+if us.FileOffset == 0 {
+    // ==================== 状态 1: 新上传 (首片) ====================
+    written, err = a.WriteFile(lr, uploadPath)
+    
+    // 首片特殊规则: 必须 >=5MB 或完整文件
+    if written < minFirstPartSize && written != us.FileSize {
+        // 删除已写入的数据，保持状态一致性
+        if fileErr := a.RemoveFile(uploadPath); fileErr != nil {
+            rctx.Logger().Warn("Failed to remove initial upload chunk that was too small",
+                mlog.String("upload_path", uploadPath),
+                mlog.Int("chunk_size", int(written)),
+                mlog.Int("min_size", minFirstPartSize))  // 5MB
+        }
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.first_part_too_small.app_error",
+            map[string]any{"Size": minFirstPartSize}, "", http.StatusBadRequest)
+    }
+} else if us.FileOffset < us.FileSize {
+    // ==================== 状态 2: 续传 (后续分片) ====================
+    // 使用 AppendFile 追加到现有文件末尾
+    written, err = a.AppendFile(lr, uploadPath)
+}
+
+// ==================== 状态推进: 更新 FileOffset ====================
+if written > 0 {
+    us.FileOffset += written  // 推进进度指针
+    
+    // 持久化到数据库
+    if storeErr := a.Srv().Store().UploadSession().Update(us); storeErr != nil {
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.update.app_error", 
+            nil, "", http.StatusInternalServerError).Wrap(storeErr)
+    }
+}
+
+// 写入过程中出错，返回错误 (FileOffset 已更新 if written > 0)
+if err != nil {
+    return nil, err
+}
+
+// ==================== 状态 3: 上传未完成 ====================
+if us.FileOffset != us.FileSize {
+    // 返回 (nil, nil) 表示"未完成，继续上传"
+    // 客户端可以继续 POST 数据或 GET 查询进度
+    return nil, nil
+}
+```
+
+**存储后端支持续传的差异**:
+
+| 存储后端 | WriteFile 实现 | AppendFile 实现 |
+|----------|----------------|-----------------|
+| **LocalFileBackend** | `os.O_CREATE \| os.O_TRUNC` | `os.O_APPEND` |
+| **S3FileBackend** | minio.PutObject | 依赖 S3 Multipart Upload |
+
+**LocalFileBackend 实现** (`server/platform/shared/filestore/localstore.go`):
+
+```go
+// 新建文件
+func (b *LocalFileBackend) WriteFile(fr io.Reader, path string) (int64, error) {
+    // O_CREATE: 不存在则创建
+    // O_TRUNC: 存在则截断为0
+    fw, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+    // ...
+    written, err := io.Copy(fw, fr)
+    return written, err
+}
+
+// 追加文件
+func (b *LocalFileBackend) AppendFile(fr io.Reader, path string) (int64, error) {
+    // O_APPEND: 写入时自动定位到文件末尾
+    fw, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
+    // ...
+    written, err := io.Copy(fw, fr)
+    return written, err
+}
+```
+
+### 2.2.4 断点续传实现机制
+
+**断点续传的完整交互流程**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        断点续传交互时序图                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  客户端                              服务端                              存储
+    │                                   │                                  │
+    │  1. POST /api/v4/uploads          │                                  │
+    │  {filename:"large.zip",           │                                  │
+    │   file_size:209715200,            │                                  │
+    │   channel_id:"...", type:"attachment"} │                              │
+    │──────────────────────────────────▶│                                  │
+    │                                   │  创建 UploadSession:              │
+    │                                   │  - FileOffset = 0                 │
+    │                                   │  - FileSize = 200MB              │
+    │                                   │  - 存入 UploadSessions 表        │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │◀──────────────────────────────────│                                  │
+    │  201 Created                      │                                  │
+    │  {id:"upload_123",                │                                  │
+    │   file_offset:0}                   │                                  │
+    │                                   │                                  │
+    │  2. POST /api/v4/uploads/upload_123│                                  │
+    │  Body: 第1片数据 (60MB)            │                                  │
+    │  Content-Range: bytes=0-62914559  │                                  │
+    │──────────────────────────────────▶│                                  │
+    │                                   │  校验:                            │
+    │                                   │  - 内存锁: uploadLockMap["upload_123"]=true │
+    │                                   │  - 数据库: FileOffset 应为 0      │
+    │                                   │                                  │
+    │                                   │  写入:                            │
+    │                                   │  WriteFile(..., path)            │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │                                   │  60MB 写入成功                    │
+    │                                   │                                  │
+    │                                   │  更新数据库:                       │
+    │                                   │  FileOffset = 0 + 62914560      │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │◀──────────────────────────────────│                                  │
+    │  200 OK                           │                                  │
+    │  {id:"upload_123",                │                                  │
+    │   file_offset:62914560}           │  (返回 nil, nil 表示未完成)      │
+    │                                   │                                  │
+    │  3. POST /api/v4/uploads/upload_123│                                  │
+    │  Body: 第2片数据 (70MB)            │                                  │
+    │  【网络中断！】                     │                                  │
+    │──────────────X                     │                                  │
+    │                                   │                                  │
+    │  【重试前查询状态】                 │                                  │
+    │  4. GET /api/v4/uploads/upload_123 │                                  │
+    │──────────────────────────────────▶│                                  │
+    │                                   │  从数据库查询:                     │
+    │                                   │  SELECT * FROM UploadSessions     │
+    │                                   │  WHERE Id = 'upload_123'         │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │◀──────────────────────────────────│                                  │
+    │  200 OK                           │                                  │
+    │  {id:"upload_123",                │                                  │
+    │   file_offset:62914560}           │  ← 权威进度，从这里继续          │
+    │                                   │                                  │
+    │  5. POST /api/v4/uploads/upload_123│                                  │
+    │  Body: 第2片数据 (70MB)            │                                  │
+    │  【携带 file_offset=62914560】     │                                  │
+    │──────────────────────────────────▶│                                  │
+    │                                   │  校验:                            │
+    │                                   │  - 数据库 FileOffset = 62914560   │
+    │                                   │  - 与客户端一致 ✓                   │
+    │                                   │                                  │
+    │                                   │  追加写入:                         │
+    │                                   │  AppendFile(..., path)            │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │                                   │  FileOffset = 62914560 + 73400320│
+    │                                   │  = 136314880 (130MB)              │
+    │                                   │                                  │
+    │◀──────────────────────────────────│                                  │
+    │  200 OK                           │                                  │
+    │  {id:"upload_123",                │                                  │
+    │   file_offset:136314880}          │                                  │
+    │                                   │                                  │
+    │  6. POST /api/v4/uploads/upload_123│                                  │
+    │  Body: 第3片数据 (70MB)            │                                  │
+    │  【最后一片，完成上传】              │                                  │
+    │──────────────────────────────────▶│                                  │
+    │                                   │  1. AppendFile 追加 70MB          │
+    │                                   │  2. FileOffset = 136314880 + 73400320│
+    │                                   │     = 209715200 (200MB)          │
+    │                                   │  3. FileOffset == FileSize ✓      │
+    │                                   │                                  │
+    │                                   │  【完成后处理】                     │
+    │                                   │  1. 读取文件生成 FileInfo          │
+    │                                   │  2. 图片预处理/后处理               │
+    │                                   │  3. 保存 FileInfo 到数据库         │
+    │                                   │  4. 删除 UploadSession             │
+    │                                   │─────────────────────────────────▶│
+    │                                   │◀─────────────────────────────────│
+    │◀──────────────────────────────────│                                  │
+    │  201 Created                      │                                  │
+    │  {id:"file_456",                  │  ← 返回 FileInfo，上传完成         │
+    │   name:"large.zip",               │                                  │
+    │   size:209715200}                 │                                  │
+```
+
+**API 层 - 会话状态查询** (`server/channels/api4/upload.go:68-101`):
+
+```go
+func getUpload(c *Context, w http.ResponseWriter, r *http.Request) {
+    // 从 URL 获取 upload_id
+    uploadID := c.Params.UploadId
+    
+    // 查询数据库获取当前状态
+    us, err := c.App.GetUploadSession(c.AppContext, uploadID)
+    if err != nil {
+        c.Err = err
+        return
+    }
+    
+    // 权限校验: 只能是会话所有者或系统管理员
+    if us.UserId != c.AppContext.Session().UserId && 
+       !c.App.SessionHasPermissionTo(*c.AppContext.Session(), 
+                                     model.PermissionManageSystem) {
+        c.SetPermissionError(model.PermissionManageSystem)
+        return
+    }
+    
+    // 返回会话状态，客户端据此知道从哪里继续
+    if err = json.NewEncoder(w).Encode(us); err != nil {
+        c.Logger().Warn("Error while encoding response", mlog.Err(err))
+        return
+    }
+}
+```
+
+### 2.2.5 失败重试与错误处理
+
+**错误类型与恢复策略汇总**:
+
+| 错误场景 | 错误码 | 服务端处理 | 客户端处理 |
+|----------|--------|------------|------------|
+| 并发上传冲突 | 400 Bad Request | 内存锁或 FileOffset 不匹配 | 等待后重试，或先 GET 查询进度 |
+| 首片大小不足 5MB | 400 Bad Request | 删除已写数据，FileOffset 不变 | 使用更大的分片重新上传 |
+| 会话不存在 | 404 Not Found | 返回 ErrNotFound | 重新创建会话从头开始 |
+| 网络中断 (写入中) | 连接超时 | FileOffset 可能已推进 (if written > 0) | GET 查询进度后从新 offset 继续 |
+| 数据库更新失败 | 500 Internal Error | 写入可能已成功但状态未持久化 | GET 查询主库获取权威状态 |
+| 存储后端错误 | 500 Internal Error | 视情况而定 | 重试或检查配置 |
+
+**关键代码分析 - 写入失败的处理** (`server/channels/app/upload.go:264-276`):
+
+```go
+// 注意这个顺序: 先推进状态，再检查错误
+if written > 0 {
+    // 只要写入了数据，就推进 FileOffset
+    us.FileOffset += written
+    
+    // 持久化到数据库
+    if storeErr := a.Srv().Store().UploadSession().Update(us); storeErr != nil {
+        // 数据库更新失败，但文件可能已写入
+        // 这种情况下可能出现状态不一致
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.update.app_error", 
+            nil, "", http.StatusInternalServerError).Wrap(storeErr)
+    }
+}
+
+// 检查写入过程中是否有错误
+if err != nil {
+    // 如果 written > 0，FileOffset 已经被更新并持久化
+    // 下次上传将从新的 offset 继续
+    return nil, err
+}
+```
+
+**设计特点**:
+1. **At-Least-Once 语义**: 即使部分写入也推进状态，避免重复写入已成功的数据
+2. **幂等性依赖**: 客户端需要先 GET 查询进度，不能假设上次发送了多少
+3. **主库读取**: `RequestContextWithMaster` 确保读取最新状态
+
+**客户端重试策略示例** (伪代码):
+
+```javascript
+async function uploadFileWithResumable(file, channelId) {
+    // 1. 创建会话
+    let session = await client.createUpload({
+        filename: file.name,
+        file_size: file.size,
+        channel_id: channelId,
+        type: 'attachment'
+    });
+    
+    let fileInfo = null;
+    let offset = 0;
+    const chunkSize = 8 * 1024 * 1024; // 8MB 分片
+    
+    while (offset < file.size) {
+        try {
+            const chunk = file.slice(offset, offset + chunkSize);
+            
+            // 2. 上传分片 (携带当前 offset)
+            fileInfo = await client.uploadData(session.id, chunk, offset);
+            
+            if (fileInfo) {
+                // 返回了 FileInfo，上传完成
+                break;
+            }
+            
+            // 未完成，推进 offset
+            // 注意: 实际上应该从响应或重新查询获取新的 offset
+            offset += chunk.size;
+            
+        } catch (error) {
+            // 3. 失败时查询权威状态
+            console.warn('Upload chunk failed, querying state...', error);
+            
+            // 关键: 从服务端获取真正的进度
+            session = await client.getUpload(session.id);
+            offset = session.file_offset;
+            
+            // 等待后重试
+            await sleep(1000);
+        }
+    }
+    
+    return fileInfo;
+}
+```
+
+---
+
+## 2.3 上传完成 - 收敛到 FileInfo
+
+### 2.3.1 分片上传的完成逻辑
+
+**上传完成时的处理** (`server/channels/app/upload.go:282-364`):
+
+```go
+// 上传完成的条件: FileOffset == FileSize
+if us.FileOffset != us.FileSize {
+    return nil, nil  // 未完成，继续上传
+}
+
+// ==================== 上传完成，开始收敛 ====================
+
+// 1. 读取已上传的完整文件
+file, err := a.FileReader(uploadPath)
+if err != nil {
+    return nil, model.NewAppError("UploadData", 
+        "app.upload.upload_data.read_file.app_error", 
+        nil, "", http.StatusInternalServerError).Wrap(err)
+}
+
+// 2. 生成 FileInfo (与普通上传完全相同的结构)
+info, genErr := a.genFileInfoFromReader(us.Filename, file, us.FileSize)
+file.Close()
+if genErr != nil {
+    // ... 错误处理
+}
+
+// 3. 填充元数据
+info.CreatorId = us.UserId
+info.ChannelId = us.ChannelId
+info.Path = us.Path  // 存储路径
+info.RemoteId = model.NewPointer(us.RemoteId)
+
+// 4. 运行插件钩子 (与普通上传相同)
+if err := a.runPluginsHook(rctx, info, file); err != nil {
+    return nil, err
+}
+
+// 5. 图片后处理 - 生成 thumbnail/preview/mini_preview
+if info.IsImage() && !info.IsSvg() {
+    // 分辨率检查
+    if limitErr := checkImageResolutionLimit(info.Width, info.Height, 
+        *a.Config().FileSettings.MaxImageResolution); limitErr != nil {
+        return nil, model.NewAppError("uploadData", 
+            "app.upload.upload_data.large_image.app_error",
+            map[string]any{"Filename": us.Filename, 
+                          "Width": info.Width, 
+                          "Height": info.Height}, 
+            "", http.StatusBadRequest)
+    }
+
+    // 设置衍生文件路径
+    nameWithoutExtension := info.Name[:strings.LastIndex(info.Name, ".")]
+    info.PreviewPath = filepath.Dir(info.Path) + "/" + 
+                       nameWithoutExtension + "_preview." + 
+                       getFileExtFromMimeType(info.MimeType)
+    info.ThumbnailPath = filepath.Dir(info.Path) + "/" + 
+                         nameWithoutExtension + "_thumb." + 
+                         getFileExtFromMimeType(info.MimeType)
+
+    // 读取文件数据进行处理
+    imgData, fileErr := a.ReadFile(uploadPath)
+    if fileErr != nil {
+        return nil, fileErr
+    }
+    
+    // 生成缩略图和预览图
+    a.HandleImages(rctx, 
+        []string{info.PreviewPath}, 
+        []string{info.ThumbnailPath}, 
+        [][]byte{imgData})
+}
+
+// 6. Import 类型特殊处理: 重命名去掉 .tmp 后缀
+if us.Type == model.UploadTypeImport {
+    if err := a.MoveFile(uploadPath, us.Path); err != nil {
+        return nil, model.NewAppError("UploadData", 
+            "app.upload.upload_data.move_file.app_error", 
+            nil, "", http.StatusInternalServerError).Wrap(err)
+    }
+}
+
+// 7. 保存 FileInfo 到数据库 (收敛的关键一步)
+var storeErr error
+if info, storeErr = a.Srv().Store().FileInfo().Save(rctx, info); storeErr != nil {
+    // ... 错误处理
+}
+
+// 8. 异步提取内容 (用于全文搜索)
+if *a.Config().FileSettings.ExtractContent {
+    infoCopy := *info
+    a.Srv().Go(func() {
+        err := a.ExtractContentFromFileInfo(rctx, &infoCopy)
+        if err != nil {
+            rctx.Logger().Error("Failed to extract file content", 
+                mlog.Err(err), mlog.String("fileInfoId", infoCopy.Id))
+        }
+    })
+}
+
+// 9. 删除 UploadSession (清理临时状态)
+if storeErr := a.Srv().Store().UploadSession().Delete(us.Id); storeErr != nil {
+    rctx.Logger().Warn("Failed to delete UploadSession", mlog.Err(storeErr))
+}
+
+// 10. 返回 FileInfo (与普通上传完全相同的输出)
+return info, nil
+```
+
+### 2.3.2 两种上传方式的统一收敛
+
+**收敛点对比**:
+
+| 阶段 | 普通上传 (POST /files) | 分片上传 (POST /uploads) |
+|------|------------------------|--------------------------|
+| **输入** | multipart/form-data | JSON 创建会话 + 多次数据块 |
+| **中间状态** | 无中间状态 | UploadSession (FileOffset 追踪) |
+| **存储写入** | 一次 `WriteFile` | 多次 `WriteFile` + `AppendFile` |
+| **收敛点** | `UploadFileX()` 返回 `FileInfo` | `UploadData()` 返回 `FileInfo` |
+| **输出** | `FileInfo` (PostId = "") | `FileInfo` (PostId = "") |
+| **后续处理** | 消息关联 (相同流程) | 消息关联 (相同流程) |
+
+**统一的数据结构 - FileInfo**:
+
+```go
+type FileInfo struct {
+    // 标识
+    Id              string     `json:"id"`           // 文件唯一标识
+    CreatorId       string     `json:"creator_id"`   // 上传用户
+    PostId          string     `json:"post_id"`      // 关联的消息 ID (初始为空)
+    ChannelId       string     `json:"channel_id"`   // 目标频道
+    
+    // 元数据
+    Name            string     `json:"name"`
+    Extension       string     `json:"extension"`
+    MimeType        string     `json:"mime_type"`
+    Size            int64      `json:"size"`
+    
+    // 图片特有
+    Width           int        `json:"width"`
+    Height          int        `json:"height"`
+    HasPreviewImage bool       `json:"has_preview_image"`
+    
+    // 存储路径
+    Path            string     `json:"-"`
+    PreviewPath     string     `json:"-"`
+    ThumbnailPath   string     `json:"-"`
+    
+    // 内嵌预览
+    MiniPreview     *[]byte    `json:"mini_preview"`
+}
+```
+
+### 2.3.3 从上传完成到消息展示的完整收敛流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    两种上传方式的统一收敛流程                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────┐                    ┌───────────────────────┐
+  │    普通上传路径        │                    │    分片上传路径        │
+  └───────────────────────┘                    └───────────────────────┘
+              │                                              │
+              ▼                                              ▼
+  ┌───────────────────────┐                    ┌───────────────────────┐
+  │  POST /api/v4/files   │                    │  1. POST /uploads     │
+  │  multipart/form-data  │                    │  创建 UploadSession   │
+  └───────────────────────┘                    └───────────────────────┘
+              │                                              │
+              ▼                                              ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                        服务端处理层 (app/)                            │
+  │  ┌───────────────────────┐                    ┌─────────────────────┐│
+  │  │   UploadFileX()       │                    │  CreateUploadSession ││
+  │  │  - 权限校验            │                    │  UploadData()        ││
+  │  │  - 解析 multipart     │                    │  - 并发控制          ││
+  │  │  - 写入存储            │                    │  - FileOffset 推进   ││
+  │  │  - 图片预处理/后处理   │                    │  - 循环直到完成      ││
+  │  │  - 插件钩子            │                    └──────────┬──────────┘│
+  │  └──────────┬────────────┘                               │           │
+  │             │                                            │           │
+  │             ▼                                            ▼           │
+  │  ┌─────────────────────────────────────────────────────────────────┐ │
+  │  │                    收敛点: 生成 FileInfo                          │ │
+  │  │  - 两种方式都调用 genFileInfoFromReader()                         │ │
+  │  │  - 都保存到 FileInfo 表 (PostId = "")                            │ │
+  │  │  - 都返回相同结构的 FileInfo 给客户端                              │ │
+  │  └─────────────────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────────────────┘
+              │                                              │
+              └──────────────────┬───────────────────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │   客户端获得 FileInfo   │
+                    │   {id: "file_abc",     │
+                    │    name: "report.pdf", │
+                    │    size: 1048576,      │
+                    │    post_id: ""}         │
+                    └────────────┬───────────┘
+                                 │
+                                 ▼
+                    ┌────────────────────────┐
+                    │   发送消息              │
+                    │   POST /api/v4/posts   │
+                    │   {                    │
+                    │     channel_id: "...", │
+                    │     message: "查看文件",│
+                    │     file_ids: ["file_abc"] ← 关键: 引用 file_id
+                    │   }                    │
+                    └────────────┬───────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────────────────────┐
+                    │    消息关联层 (统一处理，与上传方式无关)  │
+                    └─────────────────────────────────────────┘
+                    │                                         │
+                    ▼                                         │
+          ┌───────────────────────┐                           │
+          │  processPostFileChanges│                          │
+          │  - 计算差异            │                          │
+          │    addedFileIDs,      │                          │
+          │    removedFileIDs     │                          │
+          └───────────┬───────────┘                          │
+                      │                                      │
+                      ▼                                      │
+          ┌───────────────────────┐                           │
+          │  attachFileIDsToPost  │                          │
+          │  验证条件:             │                          │
+          │  1. FileInfo.PostId==""│                         │
+          │  2. CreatorId 匹配    │                          │
+          │  3. ChannelId 匹配    │                          │
+          └───────────┬───────────┘                          │
+                      │                                      │
+                      ▼                                      │
+          ┌───────────────────────┐                           │
+          │  更新数据库:           │                          │
+          │  FileInfo.PostId =    │                          │
+          │    post.Id             │                          │
+          └───────────┬───────────┘                          │
+                      │                                      │
+                      └──────────────────┬───────────────────┘
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │         消息展示层 (统一渲染)            │
+                    └─────────────────────────────────────────┘
+                    │                                         │
+                    ▼                                         │
+          ┌───────────────────────┐                           │
+          │  客户端获取帖子列表    │                          │
+          │  GET /api/v4/posts    │                          │
+          └───────────┬───────────┘                          │
+                      │                                      │
+                      ▼                                      │
+          ┌───────────────────────┐                           │
+          │  服务端查询:           │                          │
+          │  1. Post 表获取基础信息│                         │
+          │  2. FileInfo 表通过   │                          │
+          │     PostId 关联查询   │                          │
+          │     (支持缓存)         │                          │
+          └───────────┬───────────┘                          │
+                      │                                      │
+                      ▼                                      │
+          ┌───────────────────────┐                           │
+          │  客户端渲染:           │                          │
+          │  - 遍历 Post.FileIds  │                          │
+          │  - 根据 MIME 类型显示 │                          │
+          │    图片: 缩略图        │                          │
+          │    其他: 图标+名称     │                          │
+          └───────────────────────┘                           │
+```
+
+### 2.3.4 消息关联的核心代码
+
+**两种上传方式最终都经过相同的消息关联流程**:
+
+```go
+// server/channels/app/post_file_change.go:12-43
+func (a *App) processPostFileChanges(rctx request.CTX, 
+    newPost, oldPost *model.Post, 
+    updatePostOptions *model.UpdatePostOptions) (model.StringArray, *model.AppError) {
+    
+    // 去重 (不关心文件来自哪种上传方式)
+    newFileIDs := model.RemoveDuplicateStrings(newPost.FileIds)
+    oldFileIDs := model.RemoveDuplicateStrings(oldPost.FileIds)
+    
+    // 计算差异 (只关心 file_id，不关心上传方式)
+    addedFileIDs, removedFileIDs, unchangedFileIDs := 
+        utils.FindExclusives(newFileIDs, oldFileIDs)
+
+    // 处理新增文件 (统一验证和关联)
+    if len(addedFileIDs) > 0 {
+        // 验证条件:
+        // 1. FileInfo 存在
+        // 2. FileInfo.PostId == "" (未关联到其他消息)
+        // 3. FileInfo.CreatorId 匹配当前用户
+        // 4. FileInfo.ChannelId 匹配
+        a.attachNewFilesToPost(rctx, newPost, addedFileIDs, unchangedFileIDs)
+    }
+
+    // 处理删除文件
+    if len(removedFileIDs) > 0 {
+        a.detachFilesFromPost(rctx, newPost.Id, removedFileIDs)
+    }
+
+    // 缓存失效
+    if len(addedFileIDs) > 0 || len(removedFileIDs) > 0 {
+        a.Srv().Store().FileInfo().InvalidateFileInfosForPostCache(newPost.Id, false)
+    }
+
+    return newPost.FileIds, nil
+}
+```
+
+**attachFileIDsToPost 中的验证逻辑** (统一适用于所有 FileInfo):
+
+```go
+// server/channels/app/file.go 中的实现
+func (a *App) attachFileIDsToPost(rctx request.CTX, 
+    postId, channelId, userId string, 
+    fileIDs []string) []string {
+    
+    var attachedFileIDs []string
+    
+    for _, fileID := range fileIDs {
+        // 关键查询: 通过 FileInfoStore 获取
+        // 不区分是普通上传还是分片上传生成的
+        fileInfo, err := a.Srv().Store().FileInfo().GetForUser(
+            fileID,      // 文件 ID
+            userId,      // 上传用户
+            channelId)   // 目标频道
+        
+        if err != nil {
+            rctx.Logger().Warn("Unable to attach file to post", 
+                mlog.String("file_id", fileID), mlog.Err(err))
+            continue
+        }
+        
+        // 验证未关联到其他消息
+        if fileInfo.PostId != "" {
+            rctx.Logger().Warn("File already attached to another post", 
+                mlog.String("file_id", fileID))
+            continue
+        }
+        
+        // 关联: 更新 FileInfo.PostId
+        err = a.Srv().Store().FileInfo().AttachToPost(
+            fileID,   // 文件 ID
+            postId,   // 消息 ID
+            userId)   // 用户 ID (验证)
+        
+        if err != nil {
+            rctx.Logger().Warn("Failed to attach file to post", 
+                mlog.String("file_id", fileID), mlog.Err(err))
+            continue
+        }
+        
+        attachedFileIDs = append(attachedFileIDs, fileID)
+    }
+    
+    return attachedFileIDs
 }
 ```
 
@@ -737,477 +1546,3 @@ func (t *UploadFileTask) postprocessImage(file io.Reader) {
 
     // 2. 生成预览图
     go func() {
-        defer wg.Done()
-        writeImage(imaging.GeneratePreview(decoded, imagePreviewWidth), 
-            t.fileinfo.PreviewPath)
-    }()
-
-    // 3. 生成微型预览
-    go func() {
-        defer wg.Done()
-        if t.fileinfo.MiniPreview == nil {
-            if miniPreview, err := imaging.GenerateMiniPreviewImage(decoded,
-                miniPreviewImageWidth, miniPreviewImageHeight, jpegEncQuality); err != nil {
-                t.Logger.Info("Unable to generate mini preview image", mlog.Err(err))
-            } else {
-                t.fileinfo.MiniPreview = &miniPreview
-            }
-        }
-    }()
-
-    wg.Wait()
-}
-```
-
-**图片编码写入**:
-
-```go
-writeImage := func(img image.Image, path string) {
-    r, w := io.Pipe()
-    
-    go func() {
-        var err error
-        if imgType == "png" {
-            err = t.imgEncoder.EncodePNG(w, img)
-        } else {
-            err = t.imgEncoder.EncodeJPEG(w, img, jpegEncQuality)  // 质量 90
-        }
-        // ... 错误处理
-        w.Close()
-    }()
-    
-    // 通过管道流式写入存储
-    _, aerr := t.writeFile(r, path)
-    // ...
-}
-```
-
-### 5.4 延迟生成 MiniPreview
-
-MiniPreview 也可以在读取 FileInfo 时按需生成：
-
-```go
-// app/file.go:1230-1258
-func (a *App) generateMiniPreview(rctx request.CTX, fi *model.FileInfo) {
-    if fi.IsImage() && !fi.IsSvg() && fi.MiniPreview == nil {
-        // 读取原始文件
-        file, appErr := a.FileReader(fi.Path)
-        if appErr != nil {
-            return
-        }
-        defer file.Close()
-        
-        // 解码并处理
-        img, _, release, err := prepareImage(rctx, a.ch.imgDecoder, file)
-        if err != nil {
-            return
-        }
-        defer release()
-        
-        // 生成 16x16 缩略图
-        var miniPreview []byte
-        if miniPreview, err = imaging.GenerateMiniPreviewImage(img,
-            miniPreviewImageWidth, miniPreviewImageHeight, jpegEncQuality); err != nil {
-            rctx.Logger().Info("Unable to generate mini preview image", mlog.Err(err))
-        } else {
-            fi.MiniPreview = &miniPreview
-        }
-        
-        // 保存回数据库
-        if _, err = a.Srv().Store().FileInfo().Upsert(rctx, fi); err != nil {
-            rctx.Logger().Debug("Creating mini preview failed", mlog.Err(err))
-        } else {
-            a.Srv().Store().FileInfo().InvalidateFileInfosForPostCache(fi.PostId, false)
-        }
-    }
-}
-```
-
----
-
-## 6. 消息关联与展示
-
-### 6.1 数据模型关联
-
-**Post 与 FileInfo 的关联方式**:
-
-```
-┌─────────────────┐         ┌─────────────────┐
-│     Post        │         │    FileInfo     │
-├─────────────────┤         ├─────────────────┤
-│ Id (PK)         │◄────────┤ PostId (FK)     │
-│ FileIds []string│────────►│                 │
-│ ChannelId       │         │ ChannelId       │
-│ UserId          │         │ CreatorId       │
-└─────────────────┘         └─────────────────┘
-```
-
-**双向关联设计**:
-- `Post.FileIds`: 有序的文件 ID 列表，决定展示顺序
-- `FileInfo.PostId`: 反向引用，支持级联删除和查询
-
-### 6.2 帖子创建/更新时的文件处理
-
-**核心函数**: `processPostFileChanges`
-
-**代码位置**: `server/channels/app/post_file_change.go:12-43`
-
-```go
-func (a *App) processPostFileChanges(rctx request.CTX, 
-    newPost, oldPost *model.Post, 
-    updatePostOptions *model.UpdatePostOptions) (model.StringArray, *model.AppError) {
-    
-    // 去重
-    newFileIDs := model.RemoveDuplicateStrings(newPost.FileIds)
-    oldFileIDs := model.RemoveDuplicateStrings(oldPost.FileIds)
-    
-    // 计算差异: 新增、删除、未变
-    addedFileIDs, removedFileIDs, unchangedFileIDs := 
-        utils.FindExclusives(newFileIDs, oldFileIDs)
-
-    // 处理新增文件
-    if len(addedFileIDs) > 0 {
-        if updatePostOptions != nil && updatePostOptions.IsRestorePost {
-            // 恢复帖子: 恢复软删除的文件记录
-            err := a.Srv().Store().FileInfo().RestoreForPostByIds(rctx, 
-                newPost.Id, addedFileIDs)
-            // ...
-        } else {
-            // 普通新增: 将文件关联到帖子
-            a.attachNewFilesToPost(rctx, newPost, addedFileIDs, unchangedFileIDs)
-        }
-    }
-
-    // 处理删除文件
-    if len(removedFileIDs) > 0 {
-        if appErr := a.detachFilesFromPost(rctx, newPost.Id, removedFileIDs); appErr != nil {
-            return nil, appErr
-        }
-    }
-
-    // 缓存失效
-    if len(addedFileIDs) > 0 || len(removedFileIDs) > 0 {
-        a.Srv().Store().FileInfo().InvalidateFileInfosForPostCache(newPost.Id, false)
-    }
-
-    return newPost.FileIds, nil
-}
-```
-
-### 6.3 文件关联逻辑
-
-**attachNewFilesToPost** - 将上传的文件绑定到帖子：
-
-```go
-// post_file_change.go:45-62
-func (a *App) attachNewFilesToPost(rctx request.CTX, post *model.Post, 
-    addedFileIDs, unchangedFileIDs []string) {
-    
-    // 注意：使用 session 用户 ID 而非帖子作者 ID
-    // 支持管理员在他人帖子中附加文件
-    userId := rctx.Session().UserId
-    
-    attachedFileIDs := a.attachFileIDsToPost(rctx, 
-        post.Id, post.ChannelId, userId, addedFileIDs)
-    
-    // 如果部分文件无法关联，保留成功的 + 未变更的
-    if len(attachedFileIDs) != len(addedFileIDs) {
-        post.FileIds = append(attachedFileIDs, unchangedFileIDs...)
-    }
-}
-```
-
-**attachFileIDsToPost** 的核心逻辑 (在 `app/file.go` 中):
-
-```go
-func (a *App) attachFileIDsToPost(rctx request.CTX, postId, channelId, userId string, 
-    fileIDs []string) []string {
-    
-    var attachedFileIDs []string
-    
-    for _, fileID := range fileIDs {
-        // 验证文件: 未被删除、属于当前用户、频道匹配
-        fileInfo, err := a.Srv().Store().FileInfo().GetForUser(fileID, userId, channelId)
-        if err != nil {
-            rctx.Logger().Warn("Unable to attach file to post", 
-                mlog.String("file_id", fileID), mlog.Err(err))
-            continue
-        }
-        
-        // 跳过已关联到其他帖子的文件
-        if fileInfo.PostId != "" {
-            rctx.Logger().Warn("File already attached to another post", 
-                mlog.String("file_id", fileID))
-            continue
-        }
-        
-        // 更新 FileInfo.PostId
-        err = a.Srv().Store().FileInfo().AttachToPost(fileID, postId, userId)
-        if err != nil {
-            rctx.Logger().Warn("Failed to attach file to post", 
-                mlog.String("file_id", fileID), mlog.Err(err))
-            continue
-        }
-        
-        attachedFileIDs = append(attachedFileIDs, fileID)
-    }
-    
-    return attachedFileIDs
-}
-```
-
-### 6.4 文件解除关联与软删除
-
-**detachFilesFromPost**:
-
-```go
-// post_file_change.go:64-70
-func (a *App) detachFilesFromPost(rctx request.CTX, postId string, 
-    removedFileIDs []string) *model.AppError {
-    
-    // 软删除: 标记 DeleteAt，不实际删除文件
-    if err := a.Srv().Store().FileInfo().DeleteForPostByIds(rctx, 
-        postId, removedFileIDs); err != nil {
-        return model.NewAppError("app.detachFilesFromPost", 
-            "app.file_info.delete_for_post_ids.app_error", 
-            map[string]any{"post_id": postId}, "", 0).Wrap(err)
-    }
-    return nil
-}
-```
-
-### 6.5 展示流程
-
-#### API 层获取帖子文件
-
-当客户端请求帖子列表时，服务端通过以下方式获取关联的文件信息：
-
-```go
-// 获取单个帖子的文件
-fileInfos, err := a.Srv().Store().FileInfo().GetForPost(post.Id, 
-    true,    // 允许从缓存获取
-    false,   // 不包含已删除的
-    false)   // 不分页
-
-// 批量获取帖子的文件
-fileInfosMap, err := a.Srv().Store().FileInfo().GetForPosts(postIds, 
-    true,    // 从缓存
-    true)    // 仅获取已删帖子的文件 (内容审核场景)
-```
-
-#### 客户端展示
-
-Webapp 端的文件展示逻辑 (`webapp/channels/src/components/file_upload/`):
-
-1. **上传中状态**: 显示进度条、client_id 临时标识
-2. **上传完成**: 使用返回的 `file_id` 替换 `client_id`
-3. **消息渲染**:
-   - 图片: 显示缩略图，点击加载预览图
-   - 非图片: 显示文件图标、名称、大小
-   - MiniPreview: 用于消息列表中的小图标
-
-#### 文件下载端点的缓存策略
-
-```go
-// api4/file.go:868
-w.Header().Set("Cache-Control", "max-age=2592000, private")  // 30 天私有缓存
-```
-
----
-
-## 7. 异步处理与扩展点
-
-### 7.1 文件内容提取 (Content Extraction)
-
-用于全文搜索，上传后异步执行：
-
-```go
-// app/file.go:859-867
-if *a.Config().FileSettings.ExtractContent && t.ExtractContent {
-    infoCopy := *t.fileinfo
-    // 异步 goroutine 执行
-    a.Srv().GoBuffered(func() {
-        err := a.ExtractContentFromFileInfo(rctx, &infoCopy)
-        if err != nil {
-            rctx.Logger().Error("Failed to extract file content", 
-                mlog.Err(err), mlog.String("fileInfoId", infoCopy.Id))
-        }
-    })
-}
-```
-
-**提取内容存储**: `FileInfo.Content` 字段，用于后续搜索。
-
-### 7.2 插件钩子
-
-#### 上传时钩子
-
-```go
-// app/upload.go:56-128
-func (a *App) runPluginsHook(rctx request.CTX, info *model.FileInfo, file io.Reader) *model.AppError {
-    // 使用管道避免全量加载到内存
-    r, w := io.Pipe()
-    
-    go func() {
-        defer w.Close()
-        a.ch.RunMultiHook(func(hooks plugin.Hooks, _ *model.Manifest) bool {
-            // 插件可以:
-            // 1. 拒绝上传 (返回 rejectionReason)
-            // 2. 修改 FileInfo (返回 newInfo)
-            // 3. 修改文件内容 (写入 newBytes)
-            newInfo, rejStr := hooks.FileWillBeUploaded(pluginContext, info, file, w)
-            
-            if rejStr != "" {
-                rejErr = model.NewAppError("runPluginsHook", 
-                    "app.upload.run_plugins_hook.rejected", ...)
-                return false
-            }
-            if newInfo != nil {
-                info = newInfo
-            }
-            return true
-        }, plugin.FileWillBeUploadedID)
-    }()
-    
-    // 读取管道，写入临时文件
-    tmpPath := filePath + ".tmp"
-    written, err := a.WriteFile(r, tmpPath)
-    // ...
-    
-    // 如果插件修改了内容，替换原文件
-    if written > 0 {
-        info.Size = written
-        if fileErr := a.MoveFile(tmpPath, info.Path); fileErr != nil {
-            return fileErr
-        }
-    }
-    
-    return rejErr
-}
-```
-
-#### 下载时钩子
-
-```go
-// api4/file.go:606-614
-rejectionReason := c.App.RunFileWillBeDownloadedHook(c.AppContext, 
-    fileInfo, c.AppContext.Session().UserId, 
-    r.Header.Get(model.ConnectionId), model.FileDownloadTypeFile)
-
-if rejectionReason != "" {
-    w.Header().Set(model.HeaderRejectReason, rejectionReason)
-    c.Err = model.NewAppError("getFile", 
-        "api.file.get_file.rejected_by_plugin",
-        map[string]any{"Reason": rejectionReason}, "", http.StatusForbidden)
-    return
-}
-```
-
-**下载类型枚举**:
-- `FileDownloadTypeFile` - 原始文件
-- `FileDownloadTypeThumbnail` - 缩略图
-- `FileDownloadTypePreview` - 预览图
-- `FileDownloadTypePublic` - 公开链接下载
-
----
-
-## 8. 关键配置项
-
-### FileSettings 配置
-
-| 配置项 | 类型 | 说明 |
-|--------|------|------|
-| `EnableFileAttachments` | bool | 全局开关 |
-| `MaxFileSize` | int64 | 单文件大小限制 (字节) |
-| `DriverName` | string | `local` 或 `amazons3` |
-| `Directory` | string | 本地存储路径 |
-| `ExtractContent` | bool | 是否提取内容用于搜索 |
-| `MaxImageResolution` | int64 | 图片像素限制 (宽×高) |
-| `EnablePublicLink` | bool | 是否允许公开链接 |
-| `PublicLinkSalt` | string | 公开链接哈希盐值 |
-
-### S3 特有配置
-
-| 配置项 | 说明 |
-|--------|------|
-| `AmazonS3Bucket` | 存储桶名 |
-| `AmazonS3Region` | 区域 |
-| `AmazonS3Endpoint` | 端点 (如 `s3.amazonaws.com`) |
-| `AmazonS3AccessKeyId` / `SecretAccessKey` | 凭证 |
-| `AmazonS3PathPrefix` | 路径前缀 |
-| `AmazonS3SSL` | 是否使用 HTTPS |
-| `AmazonS3SSE` | 服务端加密 |
-| `AmazonS3UploadPartSizeBytes` | 分片大小 |
-
----
-
-## 9. 总结
-
-### 权限校验环节汇总
-
-| 阶段 | 校验内容 | 代码位置 |
-|------|----------|----------|
-| **上传前** | 会话有效性 | `APISessionRequired` |
-| **上传时** | RBAC: `upload_file` 权限 | `SessionHasPermissionToChannel` |
-| **上传时** | ABAC: 上传附件策略 | `HasPermissionToFileAction` |
-| **上传时** | 频道有效性 (非删除/非受限 DM) | `GetChannel`, `CheckIfChannelIsRestrictedDM` |
-| **下载前** | 会话有效性 | `APISessionRequiredTrustRequester` |
-| **下载时** | 频道读取权限 | `SessionHasPermissionToReadChannel` |
-| **下载时** | 特殊: 自己的文件/书签文件 | `CreatorId` 判断 |
-| **下载时** | ABAC: 下载附件策略 | `HasPermissionToFileAction` |
-| **下载时** | 插件拦截 | `RunFileWillBeDownloadedHook` |
-| **公开链接** | Hash 校验 (常量时间比较) | `subtle.ConstantTimeCompare` |
-
-### 存储后端适配要点
-
-1. **接口抽象**: `FileBackend` 定义了完整的文件操作契约
-2. **策略模式**: `NewFileBackend` 工厂根据配置动态选择实现
-3. **统一配置**: `FileBackendSettings` 统一本地和 S3 配置
-4. **能力扩展**: 可选接口 `FileBackendWithLinkGenerator`, `ContextWriter`
-5. **S3 特性**: 支持 V2/V4 签名、IAM 角色、服务端加密、预签名 URL
-
-### 端到端流程示例
-
-**上传文件并发送消息**:
-
-```
-1. Webapp → POST /api/v4/files (multipart)
-   └─> 校验: session, upload_file 权限, ABAC, 频道存在
-   
-2. API 层 → app.UploadFileX()
-   ├─> 预处理: 图片解码, 分辨率检查, EXIF 方向
-   ├─> 写入存储: backend.WriteFile()  (local 或 S3)
-   ├─> 插件钩子: FileWillBeUploaded
-   ├─> 后处理: 生成 thumbnail/preview/mini_preview
-   ├─> 提取内容: 异步 ExtractContentFromFileInfo
-   └─> 保存 FileInfo 到数据库 (PostId = "" 暂未关联)
-
-3. Webapp → POST /api/v4/posts
-   ├─> Post.FileIds = [上传返回的 file_id]
-   └─> app.processPostFileChanges()
-       ├─> 验证文件属于当前用户且未关联
-       └─> 更新 FileInfo.PostId = post.Id
-
-4. 消息渲染
-   └─> 客户端根据 FileInfo 类型显示:
-       - 图片: <img src="/api/v4/files/{id}/thumbnail">
-       - 其他: 文件图标 + 名称 + 下载链接
-```
-
----
-
-## 附录: 核心代码文件索引
-
-| 功能模块 | 文件路径 |
-|----------|----------|
-| API 层 - 上传端点 | `server/channels/api4/file.go` |
-| API 层 - 分片上传 | `server/channels/api4/upload.go` |
-| 业务逻辑 - 核心上传 | `server/channels/app/file.go` |
-| 业务逻辑 - 分片上传 | `server/channels/app/upload.go` |
-| 业务逻辑 - 消息关联 | `server/channels/app/post_file_change.go` |
-| 存储后端 - 接口定义 | `server/platform/shared/filestore/filesstore.go` |
-| 存储后端 - 本地实现 | `server/platform/shared/filestore/localstore.go` |
-| 存储后端 - S3 实现 | `server/platform/shared/filestore/s3store.go` |
-| 数据模型 - FileInfo | `server/public/model/file_info.go` |
-| 图片处理 | `server/channels/app/imaging/` |
-| 内容提取 | `server/platform/services/docextractor/` |
